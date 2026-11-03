@@ -1,6 +1,6 @@
 ## Interface: 120107, 120105, 120100, 120000
 ## Title: ReciPeek
-## Notes: Peek at craftable sub-reagent recipes in a tabbed side-window, craft sub-reagents in 1 click, or jump straight to their recipe page.
+## Notes: Peek at craftable reagent recipes in a side window that you can craft from or jump to its recipe page.
 ## Author: Dantigravity
 ## Version: 1.0.0
 ## IconTexture: 4620670
