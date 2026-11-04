@@ -2,7 +2,7 @@
 ## Title: ReciPeek
 ## Notes: Peek at craftable reagent recipes in a side window that you can craft from or jump to its recipe page.
 ## Author: Dantigravity
-## Version: 1.0.0
+## Version: 1.1.0
 ## IconTexture: 4620670
 ## Category-enUS: Professions
 

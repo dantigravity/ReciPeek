@@ -1,4 +1,4 @@
--- ReciPeek.lua (v1.0.0 - Tabbed Sub-Reagent Peek Window, 1-Click Sub-Crafting & Recipe Jump by Dantigravity)
+-- ReciPeek.lua (v1.1.0 - Crafting Orders Tab Support, Tabbed Reagent Peek Window & 1-Click Crafting by Dantigravity)
 local ADDON_NAME = "ReciPeek"
 
 SLASH_RECIPEEK1 = "/rp"
@@ -7,6 +7,7 @@ SLASH_RECIPEEK2 = "/recipeek"
 -- Maps outputItemID -> recipeID for the currently open profession
 local itemToRecipeMap = {}
 local recipeNameCache = {}
+local lastScannedRecipeCount = 0
 
 -- Open tabs in the ReciPeek side window: list of { recipeID = number, name = string, icon = number }
 local openTabs = {}
@@ -43,10 +44,12 @@ end
 local function RebuildProfessionItemMap()
     wipe(itemToRecipeMap)
     wipe(recipeNameCache)
+    lastScannedRecipeCount = 0
 
     if not C_TradeSkillUI or not C_TradeSkillUI.GetAllRecipeIDs then return end
     local allRecipes = C_TradeSkillUI.GetAllRecipeIDs()
     if not allRecipes then return end
+    lastScannedRecipeCount = #allRecipes
 
     for _, recipeID in ipairs(allRecipes) do
         local info = C_TradeSkillUI.GetRecipeInfo(recipeID)
@@ -85,20 +88,57 @@ local function RebuildProfessionItemMap()
     end
 end
 
--- Returns the currently displayed recipeID in the main ProfessionsFrame schematic panel
-local function GetCurrentDisplayedRecipeID()
-    if not ProfessionsFrame or not ProfessionsFrame.CraftingPage then return nil end
-    local form = ProfessionsFrame.CraftingPage.SchematicForm
-    if form then
-        if form.GetRecipeInfo then
-            local info = form:GetRecipeInfo()
-            if info and info.recipeID then return info.recipeID end
-        end
-        if form.currentRecipeInfo and form.currentRecipeInfo.recipeID then
-            return form.currentRecipeInfo.recipeID
-        end
+-- Returns the SchematicForm inside the Crafting Orders tab (OrderView) if it exists
+local function GetOrderSchematicForm()
+    if not ProfessionsFrame or not ProfessionsFrame.OrdersPage then return nil end
+    local orderView = ProfessionsFrame.OrdersPage.OrderView
+    if orderView and orderView.OrderDetails and orderView.OrderDetails.SchematicForm then
+        return orderView.OrderDetails.SchematicForm
     end
     return nil
+end
+
+-- Helper to extract recipeID from any Blizzard SchematicForm
+local function GetRecipeIDFromForm(form)
+    if not form then return nil end
+    if form.GetRecipeInfo then
+        local ok, info = pcall(form.GetRecipeInfo, form)
+        if ok and info and info.recipeID then return info.recipeID end
+    end
+    if form.currentRecipeInfo and form.currentRecipeInfo.recipeID then
+        return form.currentRecipeInfo.recipeID
+    end
+    if form.recipeSchematic and form.recipeSchematic.recipeID then
+        return form.recipeSchematic.recipeID
+    end
+    return nil
+end
+
+-- Returns the currently displayed recipeID in either the Crafting Orders tab OR the main Recipes tab
+local function GetCurrentDisplayedRecipeID()
+    if not ProfessionsFrame or not ProfessionsFrame:IsShown() then return nil end
+
+    -- 1. Check Crafting Orders tab first if OrdersPage / OrderView is currently open
+    local orderForm = GetOrderSchematicForm()
+    if orderForm and orderForm:IsShown() then
+        local orderRecipeID = GetRecipeIDFromForm(orderForm)
+        if orderRecipeID then return orderRecipeID end
+
+        local orderView = ProfessionsFrame.OrdersPage and ProfessionsFrame.OrdersPage.OrderView
+        if orderView and orderView.order and orderView.order.spellID then
+            return orderView.order.spellID
+        end
+    end
+
+    -- 2. Check main Recipes tab (CraftingPage)
+    local craftForm = ProfessionsFrame.CraftingPage and ProfessionsFrame.CraftingPage.SchematicForm
+    if craftForm and craftForm:IsShown() then
+        local craftRecipeID = GetRecipeIDFromForm(craftForm)
+        if craftRecipeID then return craftRecipeID end
+    end
+
+    -- 3. Fallback if visibility states are mid-transition
+    return GetRecipeIDFromForm(craftForm) or GetRecipeIDFromForm(orderForm)
 end
 
 -- Resolves whether an itemID is crafted by a recipe in the current profession
@@ -106,7 +146,13 @@ local function GetCraftableRecipeForItemID(itemID, allowSameAsMain)
     if not itemID then return nil end
     if not next(itemToRecipeMap) then
         RebuildProfessionItemMap()
+    elseif C_TradeSkillUI and C_TradeSkillUI.GetAllRecipeIDs then
+        local allRecipes = C_TradeSkillUI.GetAllRecipeIDs()
+        if allRecipes and #allRecipes ~= lastScannedRecipeCount then
+            RebuildProfessionItemMap()
+        end
     end
+
     local targetRecipeID = itemToRecipeMap[itemID]
     if not targetRecipeID then return nil end
     if not allowSameAsMain then
@@ -116,9 +162,17 @@ local function GetCraftableRecipeForItemID(itemID, allowSameAsMain)
     return targetRecipeID
 end
 
--- Jumps the main Blizzard Professions window directly to targetRecipeID
+-- Jumps the main Blizzard Professions window directly to targetRecipeID (switches to Recipes tab if on Crafting Orders)
 local function JumpMainWindowToRecipe(targetRecipeID)
     if not targetRecipeID then return end
+
+    if ProfessionsFrame and ProfessionsFrame:IsShown() then
+        if ProfessionsFrame.CraftingPage and not ProfessionsFrame.CraftingPage:IsShown() then
+            if ProfessionsFrame.SetTab and ProfessionsFrame.recipesTabID then
+                pcall(ProfessionsFrame.SetTab, ProfessionsFrame, ProfessionsFrame.recipesTabID)
+            end
+        end
+    end
 
     if C_TradeSkillUI and C_TradeSkillUI.OpenRecipe then
         pcall(C_TradeSkillUI.OpenRecipe, targetRecipeID)
@@ -239,6 +293,7 @@ RefreshPeekWindow = function()
         f:SetFrameStrata("HIGH")
         f:EnableMouse(true)
         f:SetMovable(true)
+        f:SetClampedToScreen(true)
         f:RegisterForDrag("LeftButton")
         f:SetScript("OnDragStart", f.StartMoving)
         f:SetScript("OnDragStop", f.StopMovingOrSizing)
@@ -258,7 +313,7 @@ RefreshPeekWindow = function()
         title:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -10)
         title:SetText("|cFF00CCFFReci|r|cFFFFD100Peek|r  |cFF888888• Recipe Inspector|r")
 
-        -- "+ Pin Current" Button (pins the currently viewed main recipe as a tab)
+        -- "+ Pin Main" Button (pins the currently viewed main recipe or Crafting Order recipe as a tab)
         local pinBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
         pinBtn:SetSize(82, 20)
         pinBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -32, -7)
@@ -313,7 +368,7 @@ RefreshPeekWindow = function()
         -- Reagent Rows Pool
         f.reagentRows = {}
 
-        -- Bottom Action Bar: [Craft 1] [Craft All] [Open Full Recipe ->]
+        -- Bottom Action Bar: [Craft 1] [Craft All] [Open Recipe ->]
         local craftOneBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
         craftOneBtn:SetSize(84, 24)
         craftOneBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 10, 12)
@@ -492,7 +547,7 @@ RefreshPeekWindow = function()
                 GameTooltip:SetItemByID(rg.itemID)
                 if rg.subRecipeID then
                     GameTooltip:AddLine(" ")
-                    GameTooltip:AddLine("|cFF00FF66<Left-Click to Peek Sub-Recipe in New Tab>|r")
+                    GameTooltip:AddLine("|cFF00FF66<Left-Click to Peek Recipe in New Tab>|r")
                     GameTooltip:AddLine("|cFF00CCFF<Ctrl + Left-Click to Open Full Recipe Page>|r")
                 end
                 GameTooltip:Show()
@@ -548,11 +603,11 @@ RefreshPeekWindow = function()
     end)
 end
 
--- Inspects a hovered or clicked UI frame inside Blizzard's SchematicForm to extract its reagent itemID
+-- Inspects a hovered or clicked UI frame inside Blizzard's SchematicForm (Recipes or Crafting Orders) to extract its reagent itemID
 local function ExtractReagentItemIDFromFrame(frame)
     local cur = frame
     local depth = 0
-    while cur and depth < 6 do
+    while cur and depth < 8 do
         if cur.GetItemID then
             local ok, id = pcall(cur.GetItemID, cur)
             if ok and type(id) == "number" and id > 0 then return id end
@@ -597,15 +652,31 @@ local function ExtractReagentItemIDFromFrame(frame)
     return nil
 end
 
--- Checks if a frame is inside the main ProfessionsFrame SchematicForm reagent area
+-- Checks if a frame is inside either the Recipes SchematicForm OR the Crafting Orders OrderView SchematicForm
 local function IsInsideSchematicForm(frame)
     if not ProfessionsFrame or not ProfessionsFrame:IsShown() then return false end
-    local form = ProfessionsFrame.CraftingPage and ProfessionsFrame.CraftingPage.SchematicForm
-    if not form or not form:IsShown() then return false end
+
+    local craftForm = ProfessionsFrame.CraftingPage and ProfessionsFrame.CraftingPage.SchematicForm
+    local orderForm = GetOrderSchematicForm()
+    local orderView = ProfessionsFrame.OrdersPage and ProfessionsFrame.OrdersPage.OrderView
 
     local cur = frame
     while cur do
-        if cur == form then return true end
+        -- Never trigger on clicks inside our own ReciPeek side window
+        if peekFrame and cur == peekFrame then
+            return false
+        end
+        -- Match main Recipes tab SchematicForm
+        if craftForm and craftForm:IsShown() and cur == craftForm then
+            return true
+        end
+        -- Match Crafting Orders tab SchematicForm (or OrderView details container)
+        if orderForm and orderForm:IsShown() and cur == orderForm then
+            return true
+        end
+        if orderView and orderView:IsShown() and cur == orderView.OrderDetails then
+            return true
+        end
         cur = cur.GetParent and cur:GetParent() or nil
     end
     return false
@@ -629,7 +700,7 @@ local function TryHookProfessionsFrame()
     end)
 end
 
--- Event Listener: Handles clicks on craftable sub-reagents & live bag count updates after crafting
+-- Event Listener: Handles clicks on craftable reagents & live bag count updates after crafting
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("TRADE_SKILL_LIST_UPDATE")
@@ -640,7 +711,7 @@ eventFrame:RegisterEvent("GLOBAL_MOUSE_DOWN")
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
-            print("|cFF00CCFFReci|r|cFFFFD100Peek|r v1.0.0 loaded! Left-Click any craftable reagent to Peek in a tab, or Ctrl + Left-Click to jump straight to its recipe.")
+            print("|cFF00CCFFReci|r|cFFFFD100Peek|r v1.1.0 loaded! Left-Click any craftable reagent in Recipes or Crafting Orders to Peek in a tab, or Ctrl + Left-Click to jump to its recipe.")
         elseif arg1 == "Blizzard_Professions" then
             TryHookProfessionsFrame()
         end
@@ -676,7 +747,7 @@ if C_AddOns and C_AddOns.IsAddOnLoaded and C_AddOns.IsAddOnLoaded("Blizzard_Prof
     TryHookProfessionsFrame()
 end
 
--- Tooltip Prompt: Shows ReciPeek shortcuts when hovering over any craftable reagent inside the Profession window
+-- Tooltip Prompt: Shows ReciPeek shortcuts when hovering over any craftable reagent inside Recipes or Crafting Orders
 if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall and Enum.TooltipDataType then
     TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Item, function(tooltip, data)
         if tooltip ~= GameTooltip then return end
@@ -689,7 +760,7 @@ if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall and Enum.Too
             local targetRecipeID = GetCraftableRecipeForItemID(data.id, false)
             if targetRecipeID then
                 local rInfo = recipeNameCache[targetRecipeID] or (C_TradeSkillUI and C_TradeSkillUI.GetRecipeInfo(targetRecipeID))
-                local rName = (rInfo and rInfo.name) or "Sub-Recipe"
+                local rName = (rInfo and rInfo.name) or "Recipe"
                 tooltip:AddLine(" ")
                 tooltip:AddLine("|cFF00FF66<Left-Click to Peek Recipe: " .. rName .. ">|r")
                 tooltip:AddLine("|cFF00CCFF<Ctrl + Left-Click to Jump to Recipe Page>|r")
@@ -705,6 +776,6 @@ SlashCmdList["RECIPEEK"] = function()
     if curID then
         OpenRecipeInPeekTab(curID)
     else
-        print("|cFF00CCFFReciPeek:|r Open a Profession window and click any craftable sub-reagent (or type /rp to pin the active recipe).")
+        print("|cFF00CCFFReciPeek:|r Open a Profession window and click any craftable reagent (or type /rp to pin the active recipe).")
     end
 end
