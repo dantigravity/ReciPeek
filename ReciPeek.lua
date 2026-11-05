@@ -1,4 +1,4 @@
--- ReciPeek.lua (v1.1.0 - Crafting Orders Tab Support, Tabbed Reagent Peek Window & 1-Click Crafting by Dantigravity)
+-- ReciPeek.lua (v1.1.1 - Custom Craft Quantity Stepper Arrows, Crafting Orders Support & Tabbed Inspector by Dantigravity)
 local ADDON_NAME = "ReciPeek"
 
 SLASH_RECIPEEK1 = "/rp"
@@ -9,7 +9,7 @@ local itemToRecipeMap = {}
 local recipeNameCache = {}
 local lastScannedRecipeCount = 0
 
--- Open tabs in the ReciPeek side window: list of { recipeID = number, name = string, icon = number }
+-- Open tabs in the ReciPeek side window: list of { recipeID = number, name = string, icon = number, craftQty = number }
 local openTabs = {}
 local activeTabIndex = 1
 local peekFrame = nil
@@ -242,6 +242,7 @@ local function GetRecipeReagentBreakdown(recipeID)
                 required = requiredQty,
                 owned = totalOwned,
                 subRecipeID = subRecipeID,
+                allReagents = slot.reagents,
             })
         end
     end
@@ -250,17 +251,48 @@ local function GetRecipeReagentBreakdown(recipeID)
     return reagentsList, maxCraftable, schematic
 end
 
+-- Calculates how many of a specific reagent itemID are still needed by parentRecipeID
+local function GetSuggestedCraftQtyForReagent(parentRecipeID, clickedItemID, subRecipeID)
+    if not parentRecipeID or not clickedItemID then return 1 end
+    local reagents = GetRecipeReagentBreakdown(parentRecipeID)
+    for _, rg in ipairs(reagents) do
+        local matches = (rg.itemID == clickedItemID)
+        if not matches and rg.allReagents then
+            for _, r in ipairs(rg.allReagents) do
+                if r.itemID == clickedItemID then
+                    matches = true
+                    break
+                end
+            end
+        end
+        if matches then
+            local missingItems = rg.required - rg.owned
+            if missingItems > 0 then
+                local subSchem = subRecipeID and C_TradeSkillUI and C_TradeSkillUI.GetRecipeSchematic and C_TradeSkillUI.GetRecipeSchematic(subRecipeID, false)
+                local minYield = (subSchem and subSchem.quantityMin and subSchem.quantityMin > 0) and subSchem.quantityMin or 1
+                return math.max(1, math.ceil(missingItems / minYield))
+            end
+            return 1
+        end
+    end
+    return 1
+end
+
 -- Forward declaration for UI refresh
 local RefreshPeekWindow
 
 -- Opens or focuses a recipe tab inside the ReciPeek side window
-local function OpenRecipeInPeekTab(recipeID)
+local function OpenRecipeInPeekTab(recipeID, suggestedQty)
     if not recipeID then return end
+    local defaultQty = (suggestedQty and suggestedQty > 0) and suggestedQty or 1
 
     -- Check if tab already exists
     for idx, tab in ipairs(openTabs) do
         if tab.recipeID == recipeID then
             activeTabIndex = idx
+            if suggestedQty and suggestedQty > 0 then
+                tab.craftQty = suggestedQty
+            end
             RefreshPeekWindow()
             return
         end
@@ -274,6 +306,7 @@ local function OpenRecipeInPeekTab(recipeID)
         recipeID = recipeID,
         name = rName,
         icon = rIcon,
+        craftQty = defaultQty,
     })
     activeTabIndex = #openTabs
     RefreshPeekWindow()
@@ -288,7 +321,7 @@ RefreshPeekWindow = function()
 
     if not peekFrame then
         local f = CreateFrame("Frame", "ReciPeekSideFrame", ProfessionsFrame, "BackdropTemplate")
-        f:SetSize(330, 430)
+        f:SetSize(336, 444)
         f:SetPoint("TOPLEFT", ProfessionsFrame, "TOPRIGHT", 6, 0)
         f:SetFrameStrata("HIGH")
         f:EnableMouse(true)
@@ -320,7 +353,7 @@ RefreshPeekWindow = function()
         pinBtn:SetText("+ Pin Main")
         pinBtn:SetScript("OnClick", function()
             local curID = GetCurrentDisplayedRecipeID()
-            if curID then OpenRecipeInPeekTab(curID) end
+            if curID then OpenRecipeInPeekTab(curID, 1) end
         end)
 
         -- Close "X" Button
@@ -345,47 +378,92 @@ RefreshPeekWindow = function()
 
         -- Active Recipe Header inside Peek Window
         local rIcon = f:CreateTexture(nil, "ARTWORK")
-        rIcon:SetSize(36, 36)
+        rIcon:SetSize(40, 40)
         rIcon:SetPoint("TOPLEFT", div, "BOTTOMLEFT", 6, -10)
         f.rIcon = rIcon
 
         local rTitle = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-        rTitle:SetPoint("TOPLEFT", rIcon, "TOPRIGHT", 10, -2)
+        rTitle:SetPoint("TOPLEFT", rIcon, "TOPRIGHT", 10, -1)
         rTitle:SetPoint("RIGHT", f, "RIGHT", -12, 0)
         rTitle:SetJustifyH("LEFT")
+        rTitle:SetWordWrap(false)
         f.rTitle = rTitle
 
+        -- "Open Recipe ->" Button tucked right under the Recipe Title in the top-left header
+        local jumpBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+        jumpBtn:SetSize(106, 20)
+        jumpBtn:SetPoint("TOPLEFT", rTitle, "BOTTOMLEFT", 0, -4)
+        jumpBtn:SetText("Open Recipe ->")
+        f.jumpBtn = jumpBtn
+
+        -- Status Line ("In Bags: X • Can Craft: Y") directly below the icon & Open Recipe button
         local rStatus = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-        rStatus:SetPoint("TOPLEFT", rTitle, "BOTTOMLEFT", 0, -4)
+        rStatus:SetPoint("TOPLEFT", rIcon, "BOTTOMLEFT", 0, -8)
+        rStatus:SetPoint("RIGHT", f, "RIGHT", -12, 0)
         rStatus:SetJustifyH("LEFT")
         f.rStatus = rStatus
 
         -- Reagents Subheader
         local reagHeader = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        reagHeader:SetPoint("TOPLEFT", rIcon, "BOTTOMLEFT", 0, -14)
+        reagHeader:SetPoint("TOPLEFT", rStatus, "BOTTOMLEFT", 0, -8)
         reagHeader:SetText("|cFFFFD100Required Materials (Click craftable rows to peek deeper):|r")
 
         -- Reagent Rows Pool
         f.reagentRows = {}
 
-        -- Bottom Action Bar: [Craft 1] [Craft All] [Open Recipe ->]
-        local craftOneBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-        craftOneBtn:SetSize(84, 24)
-        craftOneBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 10, 12)
-        craftOneBtn:SetText("Craft 1")
-        f.craftOneBtn = craftOneBtn
+        -- Bottom Action Bar: [Craft] [<] [Qty] [>]   [Craft All [X]]
+        local craftBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+        craftBtn:SetSize(68, 24)
+        craftBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 12, 12)
+        craftBtn:SetText("Craft")
+        f.craftBtn = craftBtn
+
+        -- Left Decrement Arrow Button [<]
+        local decBtn = CreateFrame("Button", nil, f)
+        decBtn:SetSize(22, 22)
+        decBtn:SetPoint("LEFT", craftBtn, "RIGHT", 4, 0)
+        decBtn:SetNormalTexture("Interface\\Buttons\\UI-SpellbookIcon-PrevPage-Up")
+        decBtn:SetPushedTexture("Interface\\Buttons\\UI-SpellbookIcon-PrevPage-Down")
+        decBtn:SetDisabledTexture("Interface\\Buttons\\UI-SpellbookIcon-PrevPage-Disabled")
+        decBtn:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight", "ADD")
+        f.decBtn = decBtn
+
+        -- Custom Quantity Numeric Input Box
+        local qtyBox = CreateFrame("EditBox", "ReciPeekQtyBox", f, "BackdropTemplate")
+        qtyBox:SetSize(42, 22)
+        qtyBox:SetPoint("LEFT", decBtn, "RIGHT", 2, 0)
+        qtyBox:SetFontObject("GameFontHighlightSmall")
+        qtyBox:SetJustifyH("CENTER")
+        qtyBox:SetAutoFocus(false)
+        qtyBox:SetNumeric(true)
+        qtyBox:SetMaxLetters(4)
+        qtyBox:SetTextInsets(2, 2, 0, 0)
+        qtyBox:SetBackdrop({
+            bgFile = "Interface\\Buttons\\WHITE8x8",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = false,
+            edgeSize = 10,
+            insets = { left = 2, right = 2, top = 2, bottom = 2 }
+        })
+        qtyBox:SetBackdropColor(0.03, 0.04, 0.06, 0.95)
+        qtyBox:SetBackdropBorderColor(0.35, 0.70, 0.95, 0.90)
+        f.qtyBox = qtyBox
+
+        -- Right Increment Arrow Button [>]
+        local incBtn = CreateFrame("Button", nil, f)
+        incBtn:SetSize(22, 22)
+        incBtn:SetPoint("LEFT", qtyBox, "RIGHT", 2, 0)
+        incBtn:SetNormalTexture("Interface\\Buttons\\UI-SpellbookIcon-NextPage-Up")
+        incBtn:SetPushedTexture("Interface\\Buttons\\UI-SpellbookIcon-NextPage-Down")
+        incBtn:SetDisabledTexture("Interface\\Buttons\\UI-SpellbookIcon-NextPage-Disabled")
+        incBtn:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight", "ADD")
+        f.incBtn = incBtn
 
         local craftAllBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-        craftAllBtn:SetSize(98, 24)
-        craftAllBtn:SetPoint("LEFT", craftOneBtn, "RIGHT", 6, 0)
+        craftAllBtn:SetSize(116, 24)
+        craftAllBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 12)
         craftAllBtn:SetText("Craft All")
         f.craftAllBtn = craftAllBtn
-
-        local jumpBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-        jumpBtn:SetSize(118, 24)
-        jumpBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -10, 12)
-        jumpBtn:SetText("Open Recipe ->")
-        f.jumpBtn = jumpBtn
 
         peekFrame = f
     end
@@ -405,7 +483,7 @@ RefreshPeekWindow = function()
 
     local xOff = 0
     local yOff = 0
-    local maxRowWidth = 310
+    local maxRowWidth = 316
 
     for idx, tab in ipairs(openTabs) do
         local btn = peekFrame.tabButtons[idx]
@@ -440,7 +518,7 @@ RefreshPeekWindow = function()
         end
 
         btn.label:SetText(string.format("|T%d:13:13:0:0|t %s", tab.icon or 134400, shortName))
-        local btnWidth = math.min(150, btn.label:GetStringWidth() + 26)
+        local btnWidth = math.min(152, btn.label:GetStringWidth() + 26)
         btn:SetWidth(btnWidth)
 
         if xOff + btnWidth > maxRowWidth and xOff > 0 then
@@ -463,11 +541,13 @@ RefreshPeekWindow = function()
         end
 
         btn:SetScript("OnClick", function()
+            if peekFrame.qtyBox then peekFrame.qtyBox:ClearFocus() end
             activeTabIndex = idx
             RefreshPeekWindow()
         end)
 
         btn.closeTab:SetScript("OnClick", function()
+            if peekFrame.qtyBox then peekFrame.qtyBox:ClearFocus() end
             table.remove(openTabs, idx)
             if activeTabIndex >= idx and activeTabIndex > 1 then
                 activeTabIndex = activeTabIndex - 1
@@ -495,9 +575,14 @@ RefreshPeekWindow = function()
     local craftableColor = (maxCraftable > 0) and "|cFF00FF66" or "|cFFFF6666"
     peekFrame.rStatus:SetText(string.format("%sIn Bags: |cFFFFFFFF%d|r  •  Can Craft: %s%d|r", learnedStatus, ownedOutput, craftableColor, maxCraftable))
 
+    peekFrame.jumpBtn:SetScript("OnClick", function()
+        if peekFrame.qtyBox then peekFrame.qtyBox:ClearFocus() end
+        JumpMainWindowToRecipe(recipeID)
+    end)
+
     for _, row in ipairs(peekFrame.reagentRows) do row:Hide() end
 
-    local rowStartY = -162
+    local rowStartY = -180
     for i, rg in ipairs(reagents) do
         local row = peekFrame.reagentRows[i]
         if not row then
@@ -565,7 +650,8 @@ RefreshPeekWindow = function()
                 if IsControlKeyDown() then
                     JumpMainWindowToRecipe(rg.subRecipeID)
                 else
-                    OpenRecipeInPeekTab(rg.subRecipeID)
+                    local suggested = GetSuggestedCraftQtyForReagent(recipeID, rg.itemID, rg.subRecipeID)
+                    OpenRecipeInPeekTab(rg.subRecipeID, suggested)
                 end
             end
         end)
@@ -573,33 +659,115 @@ RefreshPeekWindow = function()
         row:Show()
     end
 
-    -- 3. Wire Up Bottom Buttons ([Craft 1], [Craft All], [Open Recipe ->])
+    -- 3. Wire Up Bottom Controls ([Craft] [<] [Qty] [>]   [Craft All [X]])
     local canCraftNow = (maxCraftable > 0) and (not rInfo or rInfo.learned ~= false)
+    local maxAllowedQty = (maxCraftable > 0) and maxCraftable or 999
+    local currentQty = math.max(1, math.min(activeTab.craftQty or 1, maxAllowedQty))
+    activeTab.craftQty = currentQty
+
+    if not peekFrame.qtyBox:HasFocus() then
+        peekFrame.qtyBox:SetText(tostring(currentQty))
+    end
+
+    local function UpdateArrowStates(val)
+        if val <= 1 then
+            peekFrame.decBtn:Disable()
+        else
+            peekFrame.decBtn:Enable()
+        end
+        if val >= maxAllowedQty then
+            peekFrame.incBtn:Disable()
+        else
+            peekFrame.incBtn:Enable()
+        end
+    end
+
+    local function SetCustomQuantity(newVal)
+        local clamped = math.max(1, math.min(maxAllowedQty, tonumber(newVal) or 1))
+        activeTab.craftQty = clamped
+        peekFrame.qtyBox:SetText(tostring(clamped))
+        UpdateArrowStates(clamped)
+    end
+
+    UpdateArrowStates(currentQty)
+
+    peekFrame.decBtn:SetScript("OnClick", function()
+        peekFrame.qtyBox:ClearFocus()
+        local cur = tonumber(peekFrame.qtyBox:GetText()) or activeTab.craftQty or 1
+        SetCustomQuantity(cur - 1)
+    end)
+
+    peekFrame.incBtn:SetScript("OnClick", function()
+        peekFrame.qtyBox:ClearFocus()
+        local cur = tonumber(peekFrame.qtyBox:GetText()) or activeTab.craftQty or 1
+        SetCustomQuantity(cur + 1)
+    end)
+
+    peekFrame.qtyBox:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+    end)
+    peekFrame.qtyBox:SetScript("OnEditFocusGained", function(self)
+        self:HighlightText()
+        self:SetBackdropBorderColor(1.0, 0.82, 0.0, 1.0)
+    end)
+    peekFrame.qtyBox:SetScript("OnEditFocusLost", function(self)
+        self:HighlightText(0, 0)
+        self:SetBackdropBorderColor(0.35, 0.70, 0.95, 0.90)
+        SetCustomQuantity(self:GetText())
+    end)
+    peekFrame.qtyBox:SetScript("OnTextChanged", function(self, userInput)
+        if userInput then
+            local val = tonumber(self:GetText())
+            if val and val >= 1 then
+                local clamped = math.min(maxAllowedQty, val)
+                activeTab.craftQty = clamped
+                UpdateArrowStates(clamped)
+            end
+        end
+    end)
+    peekFrame.qtyBox:EnableMouseWheel(true)
+    peekFrame.qtyBox:SetScript("OnMouseWheel", function(self, delta)
+        local cur = tonumber(self:GetText()) or activeTab.craftQty or 1
+        SetCustomQuantity(cur + (delta > 0 and 1 or -1))
+    end)
+    peekFrame.qtyBox:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:AddLine("Custom Craft Quantity", 1, 0.82, 0)
+        GameTooltip:AddLine("Use the arrow buttons, type an amount, or scroll the mousewheel.", 0.85, 0.85, 0.85)
+        GameTooltip:AddLine("Press |cFF00FF66Enter|r or click |cFF00FF66Craft|r to begin.", 0.75, 0.75, 0.75)
+        GameTooltip:Show()
+    end)
+    peekFrame.qtyBox:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+    local function ExecuteCustomQtyCraft()
+        peekFrame.qtyBox:ClearFocus()
+        if not canCraftNow then return end
+        local requested = tonumber(peekFrame.qtyBox:GetText()) or activeTab.craftQty or 1
+        local countToCraft = math.max(1, math.min(requested, maxCraftable))
+        SetCustomQuantity(countToCraft)
+        if C_TradeSkillUI and C_TradeSkillUI.CraftRecipe then
+            C_TradeSkillUI.CraftRecipe(recipeID, countToCraft)
+        end
+    end
 
     if canCraftNow then
-        peekFrame.craftOneBtn:Enable()
+        peekFrame.craftBtn:Enable()
         peekFrame.craftAllBtn:Enable()
         peekFrame.craftAllBtn:SetText("Craft All [" .. maxCraftable .. "]")
     else
-        peekFrame.craftOneBtn:Disable()
+        peekFrame.craftBtn:Disable()
         peekFrame.craftAllBtn:Disable()
         peekFrame.craftAllBtn:SetText("Craft All [0]")
     end
 
-    peekFrame.craftOneBtn:SetScript("OnClick", function()
-        if C_TradeSkillUI and C_TradeSkillUI.CraftRecipe then
-            C_TradeSkillUI.CraftRecipe(recipeID, 1)
-        end
-    end)
+    peekFrame.craftBtn:SetScript("OnClick", ExecuteCustomQtyCraft)
+    peekFrame.qtyBox:SetScript("OnEnterPressed", ExecuteCustomQtyCraft)
 
     peekFrame.craftAllBtn:SetScript("OnClick", function()
+        peekFrame.qtyBox:ClearFocus()
         if maxCraftable > 0 and C_TradeSkillUI and C_TradeSkillUI.CraftRecipe then
             C_TradeSkillUI.CraftRecipe(recipeID, maxCraftable)
         end
-    end)
-
-    peekFrame.jumpBtn:SetScript("OnClick", function()
-        JumpMainWindowToRecipe(recipeID)
     end)
 end
 
@@ -711,7 +879,7 @@ eventFrame:RegisterEvent("GLOBAL_MOUSE_DOWN")
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
-            print("|cFF00CCFFReci|r|cFFFFD100Peek|r v1.1.0 loaded! Left-Click any craftable reagent in Recipes or Crafting Orders to Peek in a tab, or Ctrl + Left-Click to jump to its recipe.")
+            print("|cFF00CCFFReci|r|cFFFFD100Peek|r v1.1.1 loaded! Left-Click any craftable reagent in Recipes or Crafting Orders to Peek in a tab, or Ctrl + Left-Click to jump to its recipe.")
         elseif arg1 == "Blizzard_Professions" then
             TryHookProfessionsFrame()
         end
@@ -737,7 +905,9 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
             if IsControlKeyDown() then
                 JumpMainWindowToRecipe(targetRecipeID)
             else
-                OpenRecipeInPeekTab(targetRecipeID)
+                local parentID = GetCurrentDisplayedRecipeID()
+                local suggested = GetSuggestedCraftQtyForReagent(parentID, itemID, targetRecipeID)
+                OpenRecipeInPeekTab(targetRecipeID, suggested)
             end
         end
     end
@@ -774,7 +944,7 @@ SlashCmdList["RECIPEEK"] = function()
     RebuildProfessionItemMap()
     local curID = GetCurrentDisplayedRecipeID()
     if curID then
-        OpenRecipeInPeekTab(curID)
+        OpenRecipeInPeekTab(curID, 1)
     else
         print("|cFF00CCFFReciPeek:|r Open a Profession window and click any craftable reagent (or type /rp to pin the active recipe).")
     end
