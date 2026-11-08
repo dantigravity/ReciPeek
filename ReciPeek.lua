@@ -1,4 +1,4 @@
--- ReciPeek.lua (v1.1.2 - Craftable Sub-Reagent Highlights, Custom Quantity Stepper & Crafting Orders Support by Dantigravity)
+-- ReciPeek.lua (v1.2.0 - Crafting Order Combined-Material Row Highlighter, Sub-Reagent Indicators & Tabbed Inspector by Dantigravity)
 local ADDON_NAME = "ReciPeek"
 
 SLASH_RECIPEEK1 = "/rp"
@@ -14,8 +14,9 @@ local openTabs = {}
 local activeTabIndex = 1
 local peekFrame = nil
 
--- Tracks Blizzard reagent slots we've decorated so we can reset them cleanly when recipes change
+-- Tracks Blizzard reagent slots and order rows we've decorated so we can reset them cleanly
 local decoratedSlots = {}
+local decoratedOrderRows = {}
 
 -- Helper: Extracts a numeric itemID from an itemLink or number
 local function ExtractItemID(input)
@@ -202,6 +203,226 @@ local function GetRecipeMaxCraftableCount(recipeID)
     end
     return maxCraftable, isLearned
 end
+
+-- ============================================================================
+-- CRAFTING ORDERS BROWSE LIST: COMBINED SUPPLIES (PATRON + PLAYER) EVALUATOR
+-- ============================================================================
+
+-- Extracts all customer/patron-provided reagents from a CraftingOrderInfo table
+local function ExtractCustomerProvidedMap(order)
+    local byItemID = {}
+
+    if not order or not order.reagents then
+        return byItemID
+    end
+
+    for _, r in ipairs(order.reagents) do
+        local isCustomer = true
+        if Enum and Enum.CraftingOrderReagentSource and Enum.CraftingOrderReagentSource.Crafter and r.source ~= nil then
+            if r.source == Enum.CraftingOrderReagentSource.Crafter then
+                isCustomer = false
+            end
+        end
+
+        if isCustomer then
+            local rInfo = r.reagentInfo or r.reagent or r
+            local nestedReagent = rInfo.reagent or r.reagent
+            local itemID = (nestedReagent and nestedReagent.itemID) or rInfo.itemID or r.itemID
+            local qty = rInfo.quantity or r.quantity or (nestedReagent and nestedReagent.quantity) or 0
+
+            if itemID and itemID > 0 and qty > 0 then
+                byItemID[itemID] = (byItemID[itemID] or 0) + qty
+            end
+        end
+    end
+
+    return byItemID
+end
+
+-- Evaluates whether a Crafting Order is learned and has 100% of combined materials (Patron + Player bags/bank)
+local function EvaluateOrderCombinedReadiness(order)
+    if not order then return false end
+    local recipeID = order.spellID or order.recipeID
+    if not recipeID or recipeID <= 0 then return false end
+
+    local rInfo = (C_TradeSkillUI and C_TradeSkillUI.GetRecipeInfo and C_TradeSkillUI.GetRecipeInfo(recipeID)) or recipeNameCache[recipeID]
+    if not rInfo or rInfo.learned == false then
+        return false
+    end
+
+    local schematic = C_TradeSkillUI and C_TradeSkillUI.GetRecipeSchematic and C_TradeSkillUI.GetRecipeSchematic(recipeID, false)
+    if not schematic or not schematic.reagentSlotSchematics then
+        return false
+    end
+
+    local customerByItemID = ExtractCustomerProvidedMap(order)
+
+    for _, slot in ipairs(schematic.reagentSlotSchematics) do
+        local isRequired = (slot.required ~= false) and (slot.reagentType == 1 or slot.reagentType == nil)
+        if isRequired and slot.reagents and #slot.reagents > 0 and (slot.quantityRequired or 0) > 0 then
+            local stillNeeded = slot.quantityRequired
+
+            -- 1. Subtract any reagents provided by the Patron / Customer for this slot
+            for _, r in ipairs(slot.reagents) do
+                local id = r.itemID
+                if id and (customerByItemID[id] or 0) > 0 and stillNeeded > 0 then
+                    local useCustomerQty = math.min(stillNeeded, customerByItemID[id])
+                    customerByItemID[id] = customerByItemID[id] - useCustomerQty
+                    stillNeeded = stillNeeded - useCustomerQty
+                end
+            end
+
+            -- 2. For any remaining quantity not provided by the patron, check the player's bags/bank
+            if stillNeeded > 0 then
+                for _, r in ipairs(slot.reagents) do
+                    local id = r and r.itemID
+                    if id and stillNeeded > 0 then
+                        local playerOwned = GetPlayerReagentCount(id)
+                        if playerOwned > 0 then
+                            local usePlayerQty = math.min(stillNeeded, playerOwned)
+                            stillNeeded = stillNeeded - usePlayerQty
+                        end
+                    end
+                end
+            end
+
+            -- If combined Patron + Player supplies still fall short for this required slot, cannot fulfill right now
+            if stillNeeded > 0 then
+                return false
+            end
+        end
+    end
+
+    return true
+end
+
+-- Creates or retrieves the clean green highlight overlay on a Crafting Order browse row (no colliding text badge)
+local function EnsureOrderRowHighlight(row)
+    if row.reciPeekOrderHighlight then return row.reciPeekOrderHighlight end
+
+    local hl = CreateFrame("Frame", nil, row, "BackdropTemplate")
+    hl:SetPoint("TOPLEFT", row, "TOPLEFT", 1, -1)
+    hl:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -1, 1)
+    hl:SetFrameLevel(math.max(1, row:GetFrameLevel()))
+    hl:EnableMouse(false)
+
+    -- Soft emerald-green fill behind the order row
+    local bg = hl:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    bg:SetColorTexture(0.04, 0.58, 0.22, 0.20)
+    hl.bg = bg
+
+    -- Crisp bright green accent bar on the far-left edge of the row
+    local leftBar = hl:CreateTexture(nil, "OVERLAY")
+    leftBar:SetPoint("TOPLEFT", hl, "TOPLEFT", 0, 0)
+    leftBar:SetPoint("BOTTOMLEFT", hl, "BOTTOMLEFT", 0, 0)
+    leftBar:SetWidth(3)
+    leftBar:SetColorTexture(0.10, 1.00, 0.38, 0.95)
+    hl.leftBar = leftBar
+
+    -- Subtle green border around the row
+    hl:SetBackdrop({
+        edgeFile = "Interface\\Buttons\\WHITE8x8",
+        edgeSize = 1,
+    })
+    hl:SetBackdropBorderColor(0.15, 0.90, 0.40, 0.50)
+
+    row.reciPeekOrderHighlight = hl
+    return hl
+end
+
+-- Extracts the CraftingOrderInfo table from a BrowseFrame OrderList ScrollBox row
+local function GetOrderInfoFromRow(row)
+    if not row then return nil end
+    if type(row.option) == "table" and (row.option.spellID or row.option.orderID) then
+        return row.option
+    end
+    if type(row.order) == "table" and (row.order.spellID or row.order.orderID) then
+        return row.order
+    end
+    if row.GetElementData then
+        local ok, elem = pcall(row.GetElementData, row)
+        if ok and type(elem) == "table" then
+            if type(elem.option) == "table" and (elem.option.spellID or elem.option.orderID) then
+                return elem.option
+            end
+            if type(elem.order) == "table" and (elem.order.spellID or elem.order.orderID) then
+                return elem.order
+            end
+            if elem.spellID or elem.orderID then
+                return elem
+            end
+        end
+    end
+    return nil
+end
+
+-- Updates the green highlight on a single Crafting Order row
+local function UpdateSingleOrderRowHighlight(row)
+    if not row or not row:IsShown() then
+        if row and row.reciPeekOrderHighlight then
+            row.reciPeekOrderHighlight:Hide()
+        end
+        return
+    end
+
+    local order = GetOrderInfoFromRow(row)
+    if not order then
+        if row.reciPeekOrderHighlight then
+            row.reciPeekOrderHighlight:Hide()
+        end
+        return
+    end
+
+    if EvaluateOrderCombinedReadiness(order) then
+        local hl = EnsureOrderRowHighlight(row)
+        decoratedOrderRows[row] = true
+        hl:Show()
+    elseif row.reciPeekOrderHighlight then
+        row.reciPeekOrderHighlight:Hide()
+    end
+end
+
+-- Scans all visible rows in the Crafting Orders BrowseFrame OrderList ScrollBox
+local function UpdateCraftingOrderBrowseListHighlights()
+    if not ProfessionsFrame or not ProfessionsFrame:IsShown() or not ProfessionsFrame.OrdersPage then
+        return
+    end
+
+    local browseFrame = ProfessionsFrame.OrdersPage.BrowseFrame
+    local orderList = browseFrame and browseFrame.OrderList
+    local scrollBox = orderList and orderList.ScrollBox
+
+    if not scrollBox or not scrollBox:IsShown() then
+        for row in pairs(decoratedOrderRows) do
+            if row.reciPeekOrderHighlight then
+                row.reciPeekOrderHighlight:Hide()
+            end
+        end
+        return
+    end
+
+    if not next(itemToRecipeMap) then
+        RebuildProfessionItemMap()
+    end
+
+    if scrollBox.GetFrames then
+        local frames = scrollBox:GetFrames()
+        if frames then
+            for _, row in ipairs(frames) do
+                UpdateSingleOrderRowHighlight(row)
+            end
+        end
+    elseif scrollBox.ForEachFrame then
+        scrollBox:ForEachFrame(function(row)
+            UpdateSingleOrderRowHighlight(row)
+        end)
+    end
+end
+
+-- ============================================================================
+-- NAVIGATION & BREAKDOWN HELPERS
+-- ============================================================================
 
 -- Jumps the main Blizzard Professions window directly to targetRecipeID (switches to Recipes tab if on Crafting Orders)
 local function JumpMainWindowToRecipe(targetRecipeID)
@@ -437,7 +658,7 @@ local function ApplyIndicatorsToSchematicForm(form)
             decoratedSlots[slot] = true
 
             if isLearned and subMaxCraftable > 0 then
-                -- Player has the ingredients on hand to craft this sub-reagent right now!
+                -- Player has the ingredients on hand to craft this sub-reagent right now
                 local countStr = (subMaxCraftable > 99) and "99+" or tostring(subMaxCraftable)
                 ind:SetBackdropBorderColor(0.10, 1.00, 0.35, 1.0)
                 ind.rowGlow:SetColorTexture(0.05, 0.55, 0.22, 0.24)
@@ -1087,10 +1308,11 @@ local function IsInsideSchematicForm(frame)
     return false
 end
 
--- Hooks ProfessionsFrame and both SchematicForms (Recipes + Crafting Orders) so indicators update immediately
+-- Hooks ProfessionsFrame, both SchematicForms, and the Crafting Orders Browse List ScrollBox
 local isProfessionsHooked = false
 local isCraftFormHooked = false
 local isOrderFormHooked = false
+local isOrderListHooked = false
 
 local function TryHookProfessionsFrame()
     if not ProfessionsFrame then return end
@@ -1102,6 +1324,7 @@ local function TryHookProfessionsFrame()
             C_Timer.After(0.1, function()
                 RebuildProfessionItemMap()
                 UpdateMainSchematicFormIndicators()
+                UpdateCraftingOrderBrowseListHighlights()
                 if #openTabs > 0 then RefreshPeekWindow() end
             end)
         end)
@@ -1126,20 +1349,42 @@ local function TryHookProfessionsFrame()
             C_Timer.After(0.02, UpdateMainSchematicFormIndicators)
         end)
     end
+
+    local browseFrame = ProfessionsFrame.OrdersPage and ProfessionsFrame.OrdersPage.BrowseFrame
+    local orderList = browseFrame and browseFrame.OrderList
+    local scrollBox = orderList and orderList.ScrollBox
+
+    if scrollBox and not isOrderListHooked then
+        isOrderListHooked = true
+
+        if ScrollUtil and ScrollUtil.AddInitializedFrameCallback then
+            ScrollUtil.AddInitializedFrameCallback(scrollBox, function(row)
+                UpdateSingleOrderRowHighlight(row)
+            end, nil, true)
+        end
+
+        if scrollBox.Update then
+            hooksecurefunc(scrollBox, "Update", function()
+                UpdateCraftingOrderBrowseListHighlights()
+            end)
+        end
+    end
 end
 
--- Event Listener: Handles clicks on craftable reagents & live bag count updates after crafting
+-- Event Listener: Handles clicks on craftable reagents, live bag updates, & Crafting Order list updates
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("TRADE_SKILL_LIST_UPDATE")
 eventFrame:RegisterEvent("TRADE_SKILL_DATA_SOURCE_CHANGED")
 eventFrame:RegisterEvent("BAG_UPDATE_DELAYED")
+eventFrame:RegisterEvent("CRAFTINGORDERS_CAN_REQUEST")
+eventFrame:RegisterEvent("CRAFTINGORDERS_ORDER_PLACEMENT_RESPONSE")
 eventFrame:RegisterEvent("GLOBAL_MOUSE_DOWN")
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
-            print("|cFF00CCFFReci|r|cFFFFD100Peek|r v1.1.2 loaded! Craftable reagents you have materials to make are highlighted in green.")
+            print("|cFF00CCFFReci|r|cFFFFD100Peek|r v1.2.0 loaded! Craftable reagents and Crafting Orders with combined materials on hand are highlighted in green.")
         elseif arg1 == "Blizzard_Professions" then
             TryHookProfessionsFrame()
         end
@@ -1147,10 +1392,13 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         TryHookProfessionsFrame()
         RebuildProfessionItemMap()
         UpdateMainSchematicFormIndicators()
+        UpdateCraftingOrderBrowseListHighlights()
         if peekFrame and peekFrame:IsShown() then RefreshPeekWindow() end
-    elseif event == "BAG_UPDATE_DELAYED" then
+    elseif event == "BAG_UPDATE_DELAYED" or event == "CRAFTINGORDERS_CAN_REQUEST" or event == "CRAFTINGORDERS_ORDER_PLACEMENT_RESPONSE" then
         if ProfessionsFrame and ProfessionsFrame:IsShown() then
+            TryHookProfessionsFrame()
             UpdateMainSchematicFormIndicators()
+            UpdateCraftingOrderBrowseListHighlights()
         end
         if peekFrame and peekFrame:IsShown() then
             RefreshPeekWindow()
@@ -1198,7 +1446,7 @@ if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall and Enum.Too
                 local subMaxCraftable, isLearned = GetRecipeMaxCraftableCount(targetRecipeID)
                 tooltip:AddLine(" ")
                 if isLearned and subMaxCraftable > 0 then
-                    tooltip:AddLine(string.format("|cFF00FF66Ready to Craft: Materials on hand for %d|r", subMaxCraftable))
+                    tooltip:AddLine(string.format("|cFF00FF66Ready to Craft: Materials on hand for %d|r", rg_max or subMaxCraftable))
                 else
                     tooltip:AddLine("|cFFFF6666Missing raw materials to craft right now|r")
                 end
@@ -1213,6 +1461,7 @@ end
 SlashCmdList["RECIPEEK"] = function()
     RebuildProfessionItemMap()
     UpdateMainSchematicFormIndicators()
+    UpdateCraftingOrderBrowseListHighlights()
     local curID = GetCurrentDisplayedRecipeID()
     if curID then
         OpenRecipeInPeekTab(curID, 1)
