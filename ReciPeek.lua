@@ -1,24 +1,34 @@
--- ReciPeek.lua (v1.2.0 - Crafting Order Combined-Material Row Highlighter, Sub-Reagent Indicators & Tabbed Inspector by Dantigravity)
+-- ============================================================================
+-- ReciPeek (v1.2.1)
+-- Author: Dantigravity
+-- Description: Tabbed reagent recipe inspector, custom quantity crafter, and
+--              availability highlighter for Recipes and Crafting Orders.
+-- ============================================================================
+
 local ADDON_NAME = "ReciPeek"
 
 SLASH_RECIPEEK1 = "/rp"
 SLASH_RECIPEEK2 = "/recipeek"
 
--- Maps outputItemID -> recipeID for the currently open profession
+-- Runtime state and caches
 local itemToRecipeMap = {}
 local recipeNameCache = {}
 local lastScannedRecipeCount = 0
 
--- Open tabs in the ReciPeek side window: list of { recipeID = number, name = string, icon = number, craftQty = number }
+-- Active tabs in the ReciPeek window: { recipeID = number, name = string, icon = number, craftQty = number }
 local openTabs = {}
 local activeTabIndex = 1
 local peekFrame = nil
 
--- Tracks Blizzard reagent slots and order rows we've decorated so we can reset them cleanly
+-- Tracked UI frames for overlay cleanup on refresh
 local decoratedSlots = {}
 local decoratedOrderRows = {}
 
--- Helper: Extracts a numeric itemID from an itemLink or number
+-- ============================================================================
+-- UTILITY & DATA HELPERS
+-- ============================================================================
+
+-- Extracts a numeric itemID from an itemLink string or number
 local function ExtractItemID(input)
     if type(input) == "number" then
         return input
@@ -33,7 +43,7 @@ local function ExtractItemID(input)
     return nil
 end
 
--- Returns total count of an item in player's bags + reagent bag + Warband/character bank
+-- Returns total count of an item across bags, reagent bag, character bank, and Warband bank
 local function GetPlayerReagentCount(itemID)
     if not itemID then return 0 end
     if C_Item and C_Item.GetItemCount then
@@ -44,7 +54,7 @@ local function GetPlayerReagentCount(itemID)
     return 0
 end
 
--- Scans all recipes in the currently open profession and maps every crafted outputItemID (and quality IDs) to its recipeID
+-- Indexes all recipes in the currently open profession by their crafted outputItemID
 local function RebuildProfessionItemMap()
     wipe(itemToRecipeMap)
     wipe(recipeNameCache)
@@ -92,7 +102,7 @@ local function RebuildProfessionItemMap()
     end
 end
 
--- Returns the SchematicForm inside the Crafting Orders tab (OrderView) if it exists
+-- Returns the SchematicForm used by the Crafting Orders tab (OrderView)
 local function GetOrderSchematicForm()
     if not ProfessionsFrame or not ProfessionsFrame.OrdersPage then return nil end
     local orderView = ProfessionsFrame.OrdersPage.OrderView
@@ -102,7 +112,7 @@ local function GetOrderSchematicForm()
     return nil
 end
 
--- Helper to extract recipeID from any Blizzard SchematicForm
+-- Extracts the active recipeID from a Blizzard SchematicForm frame
 local function GetRecipeIDFromForm(form)
     if not form then return nil end
     if form.GetRecipeInfo then
@@ -118,11 +128,11 @@ local function GetRecipeIDFromForm(form)
     return nil
 end
 
--- Returns the currently displayed recipeID in either the Crafting Orders tab OR the main Recipes tab
+-- Returns the recipeID currently displayed in either the Crafting Orders tab or the Recipes tab
 local function GetCurrentDisplayedRecipeID()
     if not ProfessionsFrame or not ProfessionsFrame:IsShown() then return nil end
 
-    -- 1. Check Crafting Orders tab first if OrdersPage / OrderView is currently open
+    -- 1. Crafting Orders tab (OrderView)
     local orderForm = GetOrderSchematicForm()
     if orderForm and orderForm:IsShown() then
         local orderRecipeID = GetRecipeIDFromForm(orderForm)
@@ -134,18 +144,18 @@ local function GetCurrentDisplayedRecipeID()
         end
     end
 
-    -- 2. Check main Recipes tab (CraftingPage)
+    -- 2. Main Recipes tab (CraftingPage)
     local craftForm = ProfessionsFrame.CraftingPage and ProfessionsFrame.CraftingPage.SchematicForm
     if craftForm and craftForm:IsShown() then
         local craftRecipeID = GetRecipeIDFromForm(craftForm)
         if craftRecipeID then return craftRecipeID end
     end
 
-    -- 3. Fallback if visibility states are mid-transition
+    -- 3. Fallback if tab visibility is mid-transition
     return GetRecipeIDFromForm(craftForm) or GetRecipeIDFromForm(orderForm)
 end
 
--- Resolves whether an itemID is crafted by a recipe in the current profession
+-- Checks if an itemID is crafted by a recipe in the active profession
 local function GetCraftableRecipeForItemID(itemID, allowSameAsMain)
     if not itemID then return nil end
     if not next(itemToRecipeMap) then
@@ -166,7 +176,7 @@ local function GetCraftableRecipeForItemID(itemID, allowSameAsMain)
     return targetRecipeID
 end
 
--- Fast calculation of how many times a recipeID can be crafted right now using materials on hand
+-- Returns how many times a recipeID can be crafted using materials currently on hand
 local function GetRecipeMaxCraftableCount(recipeID)
     if not recipeID then return 0, false end
     local rInfo = (C_TradeSkillUI and C_TradeSkillUI.GetRecipeInfo and C_TradeSkillUI.GetRecipeInfo(recipeID)) or recipeNameCache[recipeID]
@@ -205,10 +215,10 @@ local function GetRecipeMaxCraftableCount(recipeID)
 end
 
 -- ============================================================================
--- CRAFTING ORDERS BROWSE LIST: COMBINED SUPPLIES (PATRON + PLAYER) EVALUATOR
+-- CRAFTING ORDERS LIST: COMBINED MATERIALS (PATRON + PLAYER) HIGHLIGHTER
 -- ============================================================================
 
--- Extracts all customer/patron-provided reagents from a CraftingOrderInfo table
+-- Builds a lookup table of reagents provided by the customer/patron for an order
 local function ExtractCustomerProvidedMap(order)
     local byItemID = {}
 
@@ -239,7 +249,7 @@ local function ExtractCustomerProvidedMap(order)
     return byItemID
 end
 
--- Evaluates whether a Crafting Order is learned and has 100% of combined materials (Patron + Player bags/bank)
+-- Returns true if the order's recipe is learned and 100% of required reagents are available (Patron + Player)
 local function EvaluateOrderCombinedReadiness(order)
     if not order then return false end
     local recipeID = order.spellID or order.recipeID
@@ -262,7 +272,7 @@ local function EvaluateOrderCombinedReadiness(order)
         if isRequired and slot.reagents and #slot.reagents > 0 and (slot.quantityRequired or 0) > 0 then
             local stillNeeded = slot.quantityRequired
 
-            -- 1. Subtract any reagents provided by the Patron / Customer for this slot
+            -- 1. Subtract reagents provided by the patron/customer
             for _, r in ipairs(slot.reagents) do
                 local id = r.itemID
                 if id and (customerByItemID[id] or 0) > 0 and stillNeeded > 0 then
@@ -272,7 +282,7 @@ local function EvaluateOrderCombinedReadiness(order)
                 end
             end
 
-            -- 2. For any remaining quantity not provided by the patron, check the player's bags/bank
+            -- 2. Subtract remaining required reagents from the player's bags/bank
             if stillNeeded > 0 then
                 for _, r in ipairs(slot.reagents) do
                     local id = r and r.itemID
@@ -286,7 +296,6 @@ local function EvaluateOrderCombinedReadiness(order)
                 end
             end
 
-            -- If combined Patron + Player supplies still fall short for this required slot, cannot fulfill right now
             if stillNeeded > 0 then
                 return false
             end
@@ -296,7 +305,7 @@ local function EvaluateOrderCombinedReadiness(order)
     return true
 end
 
--- Creates or retrieves the clean green highlight overlay on a Crafting Order browse row (no colliding text badge)
+-- Creates or retrieves the green row highlight overlay for a Crafting Order list row
 local function EnsureOrderRowHighlight(row)
     if row.reciPeekOrderHighlight then return row.reciPeekOrderHighlight end
 
@@ -306,13 +315,13 @@ local function EnsureOrderRowHighlight(row)
     hl:SetFrameLevel(math.max(1, row:GetFrameLevel()))
     hl:EnableMouse(false)
 
-    -- Soft emerald-green fill behind the order row
+    -- Row background fill (RGBA: emerald green at 20% opacity)
     local bg = hl:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints()
     bg:SetColorTexture(0.04, 0.58, 0.22, 0.20)
     hl.bg = bg
 
-    -- Crisp bright green accent bar on the far-left edge of the row
+    -- Left-edge accent bar (width: 3px)
     local leftBar = hl:CreateTexture(nil, "OVERLAY")
     leftBar:SetPoint("TOPLEFT", hl, "TOPLEFT", 0, 0)
     leftBar:SetPoint("BOTTOMLEFT", hl, "BOTTOMLEFT", 0, 0)
@@ -320,7 +329,7 @@ local function EnsureOrderRowHighlight(row)
     leftBar:SetColorTexture(0.10, 1.00, 0.38, 0.95)
     hl.leftBar = leftBar
 
-    -- Subtle green border around the row
+    -- Row outline border
     hl:SetBackdrop({
         edgeFile = "Interface\\Buttons\\WHITE8x8",
         edgeSize = 1,
@@ -331,7 +340,7 @@ local function EnsureOrderRowHighlight(row)
     return hl
 end
 
--- Extracts the CraftingOrderInfo table from a BrowseFrame OrderList ScrollBox row
+-- Extracts the CraftingOrderInfo table from a ScrollBox order row
 local function GetOrderInfoFromRow(row)
     if not row then return nil end
     if type(row.option) == "table" and (row.option.spellID or row.option.orderID) then
@@ -357,7 +366,7 @@ local function GetOrderInfoFromRow(row)
     return nil
 end
 
--- Updates the green highlight on a single Crafting Order row
+-- Updates the highlight state for a single Crafting Order row
 local function UpdateSingleOrderRowHighlight(row)
     if not row or not row:IsShown() then
         if row and row.reciPeekOrderHighlight then
@@ -383,7 +392,7 @@ local function UpdateSingleOrderRowHighlight(row)
     end
 end
 
--- Scans all visible rows in the Crafting Orders BrowseFrame OrderList ScrollBox
+-- Refreshes highlights across all visible rows in the Crafting Orders BrowseFrame ScrollBox
 local function UpdateCraftingOrderBrowseListHighlights()
     if not ProfessionsFrame or not ProfessionsFrame:IsShown() or not ProfessionsFrame.OrdersPage then
         return
@@ -421,10 +430,10 @@ local function UpdateCraftingOrderBrowseListHighlights()
 end
 
 -- ============================================================================
--- NAVIGATION & BREAKDOWN HELPERS
+-- RECIPE NAVIGATION & REAGENT BREAKDOWN
 -- ============================================================================
 
--- Jumps the main Blizzard Professions window directly to targetRecipeID (switches to Recipes tab if on Crafting Orders)
+-- Opens targetRecipeID in the main Professions window (switches to Recipes tab if on Crafting Orders)
 local function JumpMainWindowToRecipe(targetRecipeID)
     if not targetRecipeID then return end
 
@@ -454,7 +463,7 @@ local function JumpMainWindowToRecipe(targetRecipeID)
     end
 end
 
--- Calculates all required reagents for a recipeID and how many times the player can craft it right now
+-- Returns the full reagent list, maximum craftable count, and schematic for a recipeID
 local function GetRecipeReagentBreakdown(recipeID)
     local reagentsList = {}
     local maxCraftable = 9999
@@ -472,7 +481,7 @@ local function GetRecipeReagentBreakdown(recipeID)
             local totalOwned = 0
             local primaryItemID = slot.reagents[1].itemID
 
-            -- Sum across all quality tiers if this reagent has Bronze/Silver/Gold variants
+            -- Sum across all quality tiers for multi-rank reagents
             for _, r in ipairs(slot.reagents) do
                 if r.itemID then
                     totalOwned = totalOwned + GetPlayerReagentCount(r.itemID)
@@ -520,7 +529,7 @@ local function GetRecipeReagentBreakdown(recipeID)
     return reagentsList, maxCraftable, schematic
 end
 
--- Calculates how many of a specific reagent itemID are still needed by parentRecipeID
+-- Calculates how many crafts of subRecipeID are needed to cover missing reagents for parentRecipeID
 local function GetSuggestedCraftQtyForReagent(parentRecipeID, clickedItemID, subRecipeID)
     if not parentRecipeID or not clickedItemID then return 1 end
     local reagents = GetRecipeReagentBreakdown(parentRecipeID)
@@ -548,10 +557,10 @@ local function GetSuggestedCraftQtyForReagent(parentRecipeID, clickedItemID, sub
 end
 
 -- ============================================================================
--- MAIN RECIPE / CRAFTING ORDER WINDOW SUB-REAGENT VISUAL INDICATORS
+-- SCHEMATIC FORM REAGENT SLOT INDICATORS
 -- ============================================================================
 
--- Creates or retrieves the non-interactive visual indicator overlay on a Blizzard reagent slot
+-- Creates or retrieves the indicator overlay frame on a Blizzard reagent slot
 local function EnsureSlotIndicator(slot)
     if slot.reciPeekIndicator then return slot.reciPeekIndicator end
     local btn = slot.Button or slot
@@ -568,7 +577,7 @@ local function EnsureSlotIndicator(slot)
         insets = { left = 2, right = 2, top = 2, bottom = 2 }
     })
 
-    -- Soft background row highlight extending across the reagent slot
+    -- Background row highlight extending across the reagent label
     local rowGlow = slot:CreateTexture(nil, "BACKGROUND")
     rowGlow:SetPoint("TOPLEFT", btn, "TOPLEFT", -2, 2)
     rowGlow:SetPoint("BOTTOMLEFT", btn, "BOTTOMLEFT", -2, -2)
@@ -576,7 +585,7 @@ local function EnsureSlotIndicator(slot)
     rowGlow:SetColorTexture(0.05, 0.55, 0.22, 0.22)
     ind.rowGlow = rowGlow
 
-    -- Compact dark-pill badge at the bottom of the reagent icon ("Craft: X" or "Peek")
+    -- Status badge anchored to the bottom of the reagent icon ("Craft: X" or "Peek")
     local pill = CreateFrame("Frame", nil, ind, "BackdropTemplate")
     pill:SetHeight(14)
     pill:SetPoint("BOTTOM", btn, "BOTTOM", 0, -4)
@@ -630,7 +639,7 @@ local function GetPrimaryItemIDFromReagentSlot(slot)
     return nil
 end
 
--- Scans a SchematicForm (Recipes or Crafting Orders) and highlights craftable sub-reagents
+-- Applies visual indicators to craftable reagent slots in a SchematicForm
 local function ApplyIndicatorsToSchematicForm(form)
     if not form or not form:IsShown() then return end
 
@@ -658,7 +667,7 @@ local function ApplyIndicatorsToSchematicForm(form)
             decoratedSlots[slot] = true
 
             if isLearned and subMaxCraftable > 0 then
-                -- Player has the ingredients on hand to craft this sub-reagent right now
+                -- Materials on hand: green border, row highlight, and craftable count
                 local countStr = (subMaxCraftable > 99) and "99+" or tostring(subMaxCraftable)
                 ind:SetBackdropBorderColor(0.10, 1.00, 0.35, 1.0)
                 ind.rowGlow:SetColorTexture(0.05, 0.55, 0.22, 0.24)
@@ -670,7 +679,7 @@ local function ApplyIndicatorsToSchematicForm(form)
                 ind.pill:Show()
                 ind:Show()
             else
-                -- Sub-reagent is craftable in this profession, but player lacks raw materials (or unlearned)
+                -- Craftable by profession, but missing raw materials (or unlearned): cyan "Peek" tag
                 ind:SetBackdropBorderColor(0.20, 0.75, 1.00, 0.65)
                 ind.rowGlow:Hide()
 
@@ -687,7 +696,7 @@ local function ApplyIndicatorsToSchematicForm(form)
     end
 end
 
--- Refreshes indicators on whichever SchematicForm (Recipes or Crafting Orders) is currently visible
+-- Updates reagent slot indicators on the active SchematicForm (Recipes or Crafting Orders)
 local function UpdateMainSchematicFormIndicators()
     for slot in pairs(decoratedSlots) do
         if slot.reciPeekIndicator then
@@ -714,15 +723,13 @@ end
 -- RECIPEEK TABBED SIDE WINDOW
 -- ============================================================================
 
--- Forward declaration for UI refresh
 local RefreshPeekWindow
 
--- Opens or focuses a recipe tab inside the ReciPeek side window
+-- Opens or focuses a recipe tab in the ReciPeek side window
 local function OpenRecipeInPeekTab(recipeID, suggestedQty)
     if not recipeID then return end
     local defaultQty = (suggestedQty and suggestedQty > 0) and suggestedQty or 1
 
-    -- Check if tab already exists
     for idx, tab in ipairs(openTabs) do
         if tab.recipeID == recipeID then
             activeTabIndex = idx
@@ -748,7 +755,7 @@ local function OpenRecipeInPeekTab(recipeID, suggestedQty)
     RefreshPeekWindow()
 end
 
--- Creates (if needed) and updates the ReciPeek tabbed side panel
+-- Builds (on first call) and refreshes the ReciPeek side panel UI
 RefreshPeekWindow = function()
     if not ProfessionsFrame or not ProfessionsFrame:IsShown() then
         if peekFrame then peekFrame:Hide() end
@@ -756,6 +763,7 @@ RefreshPeekWindow = function()
     end
 
     if not peekFrame then
+        -- Main side panel frame (width: 336, height: 444)
         local f = CreateFrame("Frame", "ReciPeekSideFrame", ProfessionsFrame, "BackdropTemplate")
         f:SetSize(336, 444)
         f:SetPoint("TOPLEFT", ProfessionsFrame, "TOPRIGHT", 6, 0)
@@ -777,12 +785,12 @@ RefreshPeekWindow = function()
         f:SetBackdropColor(0.06, 0.07, 0.10, 0.96)
         f:SetBackdropBorderColor(0.25, 0.65, 0.90, 0.95)
 
-        -- Top Title Bar
+        -- Window Title
         local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         title:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -10)
         title:SetText("|cFF00CCFFReci|r|cFFFFD100Peek|r  |cFF888888• Recipe Inspector|r")
 
-        -- "+ Pin Main" Button (pins the currently viewed main recipe or Crafting Order recipe as a tab)
+        -- "+ Pin Main" Button (pins the active recipe from Recipes or Crafting Orders)
         local pinBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
         pinBtn:SetSize(82, 20)
         pinBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -32, -7)
@@ -792,12 +800,12 @@ RefreshPeekWindow = function()
             if curID then OpenRecipeInPeekTab(curID, 1) end
         end)
 
-        -- Close "X" Button
+        -- Close Button
         local closeBtn = CreateFrame("Button", nil, f, "UIPanelCloseButton")
         closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
         closeBtn:SetScript("OnClick", function() f:Hide() end)
 
-        -- Tab Container Area
+        -- Tab Bar Container
         local tabBar = CreateFrame("Frame", nil, f)
         tabBar:SetPoint("TOPLEFT", f, "TOPLEFT", 8, -32)
         tabBar:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -32)
@@ -805,14 +813,14 @@ RefreshPeekWindow = function()
         f.tabBar = tabBar
         f.tabButtons = {}
 
-        -- Divider line below tabs
+        -- Horizontal Divider
         local div = f:CreateTexture(nil, "ARTWORK")
         div:SetHeight(1)
         div:SetPoint("TOPLEFT", tabBar, "BOTTOMLEFT", 0, -2)
         div:SetPoint("TOPRIGHT", tabBar, "BOTTOMRIGHT", 0, -2)
         div:SetColorTexture(0.25, 0.55, 0.80, 0.6)
 
-        -- Active Recipe Header inside Peek Window
+        -- Active Recipe Header
         local rIcon = f:CreateTexture(nil, "ARTWORK")
         rIcon:SetSize(40, 40)
         rIcon:SetPoint("TOPLEFT", div, "BOTTOMLEFT", 6, -10)
@@ -825,36 +833,35 @@ RefreshPeekWindow = function()
         rTitle:SetWordWrap(false)
         f.rTitle = rTitle
 
-        -- "Open Recipe ->" Button tucked right under the Recipe Title in the top-left header
+        -- "Open Recipe ->" Navigation Button (positioned below the recipe title)
         local jumpBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
         jumpBtn:SetSize(106, 20)
         jumpBtn:SetPoint("TOPLEFT", rTitle, "BOTTOMLEFT", 0, -4)
         jumpBtn:SetText("Open Recipe ->")
         f.jumpBtn = jumpBtn
 
-        -- Status Line ("In Bags: X • Can Craft: Y") directly below the icon & Open Recipe button
+        -- Inventory & Craftable Status Line
         local rStatus = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
         rStatus:SetPoint("TOPLEFT", rIcon, "BOTTOMLEFT", 0, -8)
         rStatus:SetPoint("RIGHT", f, "RIGHT", -12, 0)
         rStatus:SetJustifyH("LEFT")
         f.rStatus = rStatus
 
-        -- Reagents Subheader
+        -- Reagents List Subheader
         local reagHeader = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         reagHeader:SetPoint("TOPLEFT", rStatus, "BOTTOMLEFT", 0, -8)
         reagHeader:SetText("|cFFFFD100Required Materials (Click craftable rows to peek deeper):|r")
 
-        -- Reagent Rows Pool
         f.reagentRows = {}
 
-        -- Bottom Action Bar: [Craft] [<] [Qty] [>]   [Craft All [X]]
+        -- Bottom Crafting Controls: [Craft] [<] [Qty] [>]   [Craft All [X]]
         local craftBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
         craftBtn:SetSize(68, 24)
         craftBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 12, 12)
         craftBtn:SetText("Craft")
         f.craftBtn = craftBtn
 
-        -- Left Decrement Arrow Button [<]
+        -- Quantity Decrement Arrow [<]
         local decBtn = CreateFrame("Button", nil, f)
         decBtn:SetSize(22, 22)
         decBtn:SetPoint("LEFT", craftBtn, "RIGHT", 4, 0)
@@ -864,7 +871,7 @@ RefreshPeekWindow = function()
         decBtn:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight", "ADD")
         f.decBtn = decBtn
 
-        -- Custom Quantity Numeric Input Box
+        -- Custom Quantity Input Box
         local qtyBox = CreateFrame("EditBox", "ReciPeekQtyBox", f, "BackdropTemplate")
         qtyBox:SetSize(42, 22)
         qtyBox:SetPoint("LEFT", decBtn, "RIGHT", 2, 0)
@@ -885,7 +892,7 @@ RefreshPeekWindow = function()
         qtyBox:SetBackdropBorderColor(0.35, 0.70, 0.95, 0.90)
         f.qtyBox = qtyBox
 
-        -- Right Increment Arrow Button [>]
+        -- Quantity Increment Arrow [>]
         local incBtn = CreateFrame("Button", nil, f)
         incBtn:SetSize(22, 22)
         incBtn:SetPoint("LEFT", qtyBox, "RIGHT", 2, 0)
@@ -914,7 +921,7 @@ RefreshPeekWindow = function()
 
     peekFrame:Show()
 
-    -- 1. Render Tab Buttons (up to 2 rows of tabs so you can hold up to 6 recipes at once)
+    -- 1. Render Tab Buttons (wraps up to 2 rows)
     for _, b in ipairs(peekFrame.tabButtons) do b:Hide() end
 
     local xOff = 0
@@ -936,7 +943,7 @@ RefreshPeekWindow = function()
             btn.label = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
             btn.label:SetPoint("LEFT", btn, "LEFT", 6, 0)
 
-            -- Tiny "x" button on each tab to close individual tabs
+            -- Individual tab close button ("x")
             btn.closeTab = CreateFrame("Button", nil, btn)
             btn.closeTab:SetSize(14, 14)
             btn.closeTab:SetPoint("RIGHT", btn, "RIGHT", -3, 0)
@@ -994,7 +1001,7 @@ RefreshPeekWindow = function()
         btn:Show()
     end
 
-    -- 2. Render Active Tab's Recipe Details & Reagent List
+    -- 2. Render Active Tab Recipe Details & Reagent List
     local activeTab = openTabs[activeTabIndex]
     if not activeTab then return end
 
@@ -1117,7 +1124,7 @@ RefreshPeekWindow = function()
         row:Show()
     end
 
-    -- 3. Wire Up Bottom Controls ([Craft] [<] [Qty] [>]   [Craft All [X]])
+    -- 3. Configure Bottom Crafting Controls ([Craft] [<] [Qty] [>]   [Craft All [X]])
     local canCraftNow = (maxCraftable > 0) and (not rInfo or rInfo.learned ~= false)
     local maxAllowedQty = (maxCraftable > 0) and maxCraftable or 999
     local currentQty = math.max(1, math.min(activeTab.craftQty or 1, maxAllowedQty))
@@ -1229,7 +1236,11 @@ RefreshPeekWindow = function()
     end)
 end
 
--- Inspects a hovered or clicked UI frame inside Blizzard's SchematicForm (Recipes or Crafting Orders) to extract its reagent itemID
+-- ============================================================================
+-- FRAME INSPECTION, HOOKS & EVENTS
+-- ============================================================================
+
+-- Extracts a reagent itemID from a hovered or clicked UI frame inside SchematicForm
 local function ExtractReagentItemIDFromFrame(frame)
     local cur = frame
     local depth = 0
@@ -1278,7 +1289,7 @@ local function ExtractReagentItemIDFromFrame(frame)
     return nil
 end
 
--- Checks if a frame is inside either the Recipes SchematicForm OR the Crafting Orders OrderView SchematicForm
+-- Returns true if the given frame is inside either the Recipes or Crafting Orders SchematicForm
 local function IsInsideSchematicForm(frame)
     if not ProfessionsFrame or not ProfessionsFrame:IsShown() then return false end
 
@@ -1288,15 +1299,15 @@ local function IsInsideSchematicForm(frame)
 
     local cur = frame
     while cur do
-        -- Never trigger on clicks inside our own ReciPeek side window
+        -- Ignore clicks inside the ReciPeek side window
         if peekFrame and cur == peekFrame then
             return false
         end
-        -- Match main Recipes tab SchematicForm
+        -- Main Recipes tab SchematicForm
         if craftForm and craftForm:IsShown() and cur == craftForm then
             return true
         end
-        -- Match Crafting Orders tab SchematicForm (or OrderView details container)
+        -- Crafting Orders tab SchematicForm
         if orderForm and orderForm:IsShown() and cur == orderForm then
             return true
         end
@@ -1308,7 +1319,7 @@ local function IsInsideSchematicForm(frame)
     return false
 end
 
--- Hooks ProfessionsFrame, both SchematicForms, and the Crafting Orders Browse List ScrollBox
+-- Hooks ProfessionsFrame, SchematicForms, and the Crafting Orders ScrollBox
 local isProfessionsHooked = false
 local isCraftFormHooked = false
 local isOrderFormHooked = false
@@ -1371,7 +1382,7 @@ local function TryHookProfessionsFrame()
     end
 end
 
--- Event Listener: Handles clicks on craftable reagents, live bag updates, & Crafting Order list updates
+-- Main Event Dispatcher
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("TRADE_SKILL_LIST_UPDATE")
@@ -1405,7 +1416,7 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         end
     elseif event == "GLOBAL_MOUSE_DOWN" then
         if arg1 ~= "LeftButton" then return end
-        if IsShiftKeyDown() then return end -- Keep Shift + Left-Click for chat item linking
+        if IsShiftKeyDown() then return end -- Preserve Shift + Left-Click for chat item linking
         if not ProfessionsFrame or not ProfessionsFrame:IsShown() then return end
 
         local focus = GetMouseFoci and GetMouseFoci()[1] or (GetMouseFocus and GetMouseFocus())
@@ -1429,7 +1440,7 @@ if C_AddOns and C_AddOns.IsAddOnLoaded and C_AddOns.IsAddOnLoaded("Blizzard_Prof
     TryHookProfessionsFrame()
 end
 
--- Tooltip Prompt: Shows ReciPeek craftable status & shortcuts when hovering over any craftable reagent
+-- Tooltip Hook: Appends craftable status and click shortcuts when hovering over craftable reagents
 if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall and Enum.TooltipDataType then
     TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Item, function(tooltip, data)
         if tooltip ~= GameTooltip then return end
@@ -1446,7 +1457,7 @@ if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall and Enum.Too
                 local subMaxCraftable, isLearned = GetRecipeMaxCraftableCount(targetRecipeID)
                 tooltip:AddLine(" ")
                 if isLearned and subMaxCraftable > 0 then
-                    tooltip:AddLine(string.format("|cFF00FF66Ready to Craft: Materials on hand for %d|r", rg_max or subMaxCraftable))
+                    tooltip:AddLine(string.format("|cFF00FF66Ready to Craft: Materials on hand for %d|r", subMaxCraftable))
                 else
                     tooltip:AddLine("|cFFFF6666Missing raw materials to craft right now|r")
                 end
@@ -1457,7 +1468,7 @@ if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall and Enum.Too
     end)
 end
 
--- Slash command (/rp or /recipeek) to toggle the Peek window or pin the current recipe
+-- Slash Command Handler (/rp or /recipeek)
 SlashCmdList["RECIPEEK"] = function()
     RebuildProfessionItemMap()
     UpdateMainSchematicFormIndicators()
