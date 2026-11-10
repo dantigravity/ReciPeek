@@ -1,5 +1,5 @@
 -- ============================================================================
--- ReciPeek (v1.2.1)
+-- ReciPeek (v1.3.0)
 -- Author: Dantigravity
 -- Description: Tabbed reagent recipe inspector, custom quantity crafter, and
 --              availability highlighter for Recipes and Crafting Orders.
@@ -14,6 +14,10 @@ SLASH_RECIPEEK2 = "/recipeek"
 local itemToRecipeMap = {}
 local recipeNameCache = {}
 local lastScannedRecipeCount = 0
+local lastScannedProfessionID = nil
+
+-- Per-profession cache of each recipe's required reagent slots (used by the Recipes tab materials filter)
+local recipeRequirementCache = {}
 
 -- Active tabs in the ReciPeek window: { recipeID = number, name = string, icon = number, craftQty = number }
 local openTabs = {}
@@ -58,9 +62,15 @@ end
 local function RebuildProfessionItemMap()
     wipe(itemToRecipeMap)
     wipe(recipeNameCache)
+    wipe(recipeRequirementCache)
     lastScannedRecipeCount = 0
+    lastScannedProfessionID = nil
 
     if not C_TradeSkillUI or not C_TradeSkillUI.GetAllRecipeIDs then return end
+    if C_TradeSkillUI.GetBaseProfessionInfo then
+        local baseInfo = C_TradeSkillUI.GetBaseProfessionInfo()
+        lastScannedProfessionID = baseInfo and baseInfo.professionID
+    end
     local allRecipes = C_TradeSkillUI.GetAllRecipeIDs()
     if not allRecipes then return end
     lastScannedRecipeCount = #allRecipes
@@ -155,17 +165,31 @@ local function GetCurrentDisplayedRecipeID()
     return GetRecipeIDFromForm(craftForm) or GetRecipeIDFromForm(orderForm)
 end
 
--- Checks if an itemID is crafted by a recipe in the active profession
-local function GetCraftableRecipeForItemID(itemID, allowSameAsMain)
-    if not itemID then return nil end
+-- Rebuilds the item -> recipe index if it is empty, stale, or belongs to a different profession
+local function EnsureProfessionItemMap()
     if not next(itemToRecipeMap) then
         RebuildProfessionItemMap()
-    elseif C_TradeSkillUI and C_TradeSkillUI.GetAllRecipeIDs then
+        return
+    end
+    if C_TradeSkillUI and C_TradeSkillUI.GetBaseProfessionInfo then
+        local baseInfo = C_TradeSkillUI.GetBaseProfessionInfo()
+        if baseInfo and baseInfo.professionID and baseInfo.professionID ~= lastScannedProfessionID then
+            RebuildProfessionItemMap()
+            return
+        end
+    end
+    if C_TradeSkillUI and C_TradeSkillUI.GetAllRecipeIDs then
         local allRecipes = C_TradeSkillUI.GetAllRecipeIDs()
         if allRecipes and #allRecipes ~= lastScannedRecipeCount then
             RebuildProfessionItemMap()
         end
     end
+end
+
+-- Checks if an itemID is crafted by a recipe in the active profession
+local function GetCraftableRecipeForItemID(itemID, allowSameAsMain)
+    if not itemID then return nil end
+    EnsureProfessionItemMap()
 
     local targetRecipeID = itemToRecipeMap[itemID]
     if not targetRecipeID then return nil end
@@ -427,6 +451,399 @@ local function UpdateCraftingOrderBrowseListHighlights()
             UpdateSingleOrderRowHighlight(row)
         end)
     end
+end
+
+-- ============================================================================
+-- RECIPES TAB FILTER: "HAVE MATERIALS (INCL. SUB-CRAFTS)"
+-- ----------------------------------------------------------------------------
+-- Hides every recipe the player cannot craft right now, counting reagents they
+-- could craft first from materials on hand. All reagents for one recipe come
+-- from a single shared pool, so if a recipe needs 2x a craftable reagent and the
+-- player only has base materials for 1, that recipe stays hidden.
+-- ============================================================================
+
+local MATERIALS_FILTER_MAX_DEPTH = 6
+local BASIC_REAGENT_TYPE = (Enum and Enum.CraftingReagentType and Enum.CraftingReagentType.Basic) or 1
+local SALVAGE_RECIPE_TYPE = Enum and Enum.TradeskillRecipeType and Enum.TradeskillRecipeType.Salvage
+
+local materialsFilterEnabled = false
+local filterIncludesBank = true    -- saved in ReciPeekDB.filterIncludeBank; loaded on ADDON_LOADED
+local materialsFilterRecheckPending = false
+local listBuiltWithFilter = false  -- whether the currently displayed list was built with the filter on
+local lastFilterCandidates = {}   -- recipeID -> true for every learned recipe in the last unfiltered list
+local lastFilterResults = {}      -- recipeID -> boolean result from the last filter pass
+
+-- Returns (and caches) the required reagent slots and output yield for a recipe
+local function GetRecipeRequirements(recipeID)
+    local cached = recipeRequirementCache[recipeID]
+    if cached ~= nil then return cached or nil end
+
+    local schematic = C_TradeSkillUI and C_TradeSkillUI.GetRecipeSchematic and C_TradeSkillUI.GetRecipeSchematic(recipeID, false)
+    if not schematic or not schematic.reagentSlotSchematics then
+        recipeRequirementCache[recipeID] = false
+        return nil
+    end
+
+    local isSalvage = (SALVAGE_RECIPE_TYPE ~= nil and schematic.recipeType == SALVAGE_RECIPE_TYPE) or false
+    local req = {
+        slots = {},
+        isSalvage = isSalvage,
+        -- For salvage recipes quantityMax is the number of items consumed, not the output yield
+        salvageQuantity = math.max(1, schematic.quantityMax or 1),
+        yield = isSalvage and 1 or math.max(1, schematic.quantityMin or 1),
+    }
+
+    for _, slot in ipairs(schematic.reagentSlotSchematics) do
+        local qty = slot.quantityRequired or 0
+        local isBasic = (slot.reagentType == BASIC_REAGENT_TYPE or slot.reagentType == nil)
+        -- Basic reagents, plus any slot Blizzard flags as mandatory (e.g. Sparks on crafted gear)
+        local isRequired = (isBasic and slot.required ~= false) or slot.required == true
+        if isRequired and qty > 0 and slot.reagents and #slot.reagents > 0 then
+            local entry = { quantity = qty, reagents = {} }
+            for _, r in ipairs(slot.reagents) do
+                if r.itemID and r.itemID > 0 then
+                    table.insert(entry.reagents, { key = r.itemID, itemID = r.itemID })
+                elseif r.currencyID and r.currencyID > 0 then
+                    table.insert(entry.reagents, { key = "c" .. r.currencyID, currencyID = r.currencyID })
+                end
+            end
+            if #entry.reagents > 0 then
+                table.insert(req.slots, entry)
+            end
+        end
+    end
+
+    req.evaluable = isSalvage or #req.slots > 0
+    recipeRequirementCache[recipeID] = req
+    return req
+end
+
+-- Returns the on-hand count of a reagent (item or currency), cached for the current filter pass
+local function GetFilterReagentCount(ctx, reagent)
+    local count = ctx.counts[reagent.key]
+    if count == nil then
+        if reagent.itemID then
+            if filterIncludesBank then
+                count = GetPlayerReagentCount(reagent.itemID)
+            elseif C_Item and C_Item.GetItemCount then
+                -- Bags only (backpack, equipped bags and reagent bag); excludes character and Warband bank
+                count = C_Item.GetItemCount(reagent.itemID, false, false, false, false) or 0
+            elseif GetItemCount then
+                count = GetItemCount(reagent.itemID, false) or 0
+            else
+                count = 0
+            end
+        elseif reagent.currencyID and C_CurrencyInfo and C_CurrencyInfo.GetCurrencyInfo then
+            local info = C_CurrencyInfo.GetCurrencyInfo(reagent.currencyID)
+            count = (info and info.quantity) or 0
+        else
+            count = 0
+        end
+        ctx.counts[reagent.key] = count
+    end
+    return count
+end
+
+-- Returns a learned recipe in this profession that crafts any of the slot's reagent variants
+local function FindLearnedSubRecipe(reagents)
+    for _, r in ipairs(reagents) do
+        local subRecipeID = r.itemID and itemToRecipeMap[r.itemID]
+        if subRecipeID then
+            local cached = recipeNameCache[subRecipeID]
+            local learned = cached and cached.learned
+            if learned == nil and C_TradeSkillUI and C_TradeSkillUI.GetRecipeInfo then
+                local info = C_TradeSkillUI.GetRecipeInfo(subRecipeID)
+                learned = info and info.learned
+            end
+            if learned then return subRecipeID end
+        end
+    end
+    return nil
+end
+
+-- Reserves materials for `crafts` executions of recipeID from the shared pool, crafting any
+-- missing intermediate reagents recursively. Returns false if materials run out at any depth.
+local function ReserveCraftMaterials(recipeID, crafts, pool, ctx, depth, visiting)
+    if depth > MATERIALS_FILTER_MAX_DEPTH or visiting[recipeID] then return false end
+
+    local req = GetRecipeRequirements(recipeID)
+    if not req or req.isSalvage or not req.evaluable then return false end
+
+    visiting[recipeID] = true
+    local ok = true
+
+    for _, slot in ipairs(req.slots) do
+        local need = slot.quantity * crafts
+
+        -- 1. Use what is already on hand (any quality tier / accepted variant)
+        for _, r in ipairs(slot.reagents) do
+            if need <= 0 then break end
+            local have = pool[r.key]
+            if have == nil then have = GetFilterReagentCount(ctx, r) end
+            if have > 0 then
+                local use = math.min(have, need)
+                pool[r.key] = have - use
+                need = need - use
+            else
+                pool[r.key] = 0
+            end
+        end
+
+        -- 2. Craft the shortfall from base materials, drawing from the same pool
+        if need > 0 then
+            local subRecipeID = FindLearnedSubRecipe(slot.reagents)
+            local subReq = subRecipeID and GetRecipeRequirements(subRecipeID)
+            if not subReq or subReq.isSalvage or not subReq.evaluable then
+                ok = false
+                break
+            end
+
+            local subCrafts = math.ceil(need / subReq.yield)
+            if not ReserveCraftMaterials(subRecipeID, subCrafts, pool, ctx, depth + 1, visiting) then
+                ok = false
+                break
+            end
+
+            -- Leftover output (e.g. recipe yields 2, only 1 needed) stays available for other slots
+            local surplus = (subCrafts * subReq.yield) - need
+            if surplus > 0 then
+                local key = slot.reagents[1].key
+                pool[key] = (pool[key] or 0) + surplus
+            end
+        end
+    end
+
+    visiting[recipeID] = nil
+    return ok
+end
+
+-- Salvage recipes (Prospecting, Milling, etc.) pass if any accepted item has a full stack in bags
+local function HasSalvageMaterials(recipeID, req)
+    if not C_TradeSkillUI or not C_TradeSkillUI.GetSalvagableItemIDs then return false end
+    local ok, itemIDs = pcall(C_TradeSkillUI.GetSalvagableItemIDs, recipeID)
+    if not ok or type(itemIDs) ~= "table" then return false end
+    for _, itemID in ipairs(itemIDs) do
+        local count = 0
+        if C_Item and C_Item.GetItemCount then
+            count = C_Item.GetItemCount(itemID, false, false, false, false) or 0
+        end
+        if count >= req.salvageQuantity then return true end
+    end
+    return false
+end
+
+-- Returns true if a recipe from the native list can be crafted at least once (including sub-crafts)
+local function RecipePassesMaterialsFilter(recipeInfo, ctx)
+    if not recipeInfo or not recipeInfo.learned then return false end
+    if recipeInfo.isDummyRecipe or recipeInfo.isGatheringRecipe then return false end
+
+    local listRecipeID = recipeInfo.recipeID
+    local cached = ctx.results[listRecipeID]
+    if cached ~= nil then return cached end
+
+    -- Blizzard's numAvailable counts bank items, so it can only be trusted when the bank is included
+    local trustBlizzardCount = filterIncludesBank
+
+    local result = false
+    if trustBlizzardCount and (recipeInfo.numAvailable or 0) > 0 then
+        -- Blizzard already confirms the materials are on hand
+        result = true
+    else
+        -- Ranked recipes are listed by rank 1 but crafted with the highest learned rank
+        local craftInfo = recipeInfo
+        if recipeInfo.nextRecipeID and Professions and Professions.GetHighestLearnedRecipe then
+            craftInfo = Professions.GetHighestLearnedRecipe(recipeInfo) or recipeInfo
+        end
+
+        if trustBlizzardCount and craftInfo ~= recipeInfo and (craftInfo.numAvailable or 0) > 0 then
+            result = true
+        else
+            local req = GetRecipeRequirements(craftInfo.recipeID)
+            if req and req.isSalvage then
+                result = HasSalvageMaterials(craftInfo.recipeID, req)
+            elseif req and req.evaluable then
+                result = ReserveCraftMaterials(craftInfo.recipeID, 1, {}, ctx, 0, {})
+            end
+        end
+    end
+
+    ctx.results[listRecipeID] = result
+    return result
+end
+
+local function NewMaterialsFilterContext()
+    return { counts = {}, results = {} }
+end
+
+-- Recursively removes recipes that fail the filter, then any categories left empty
+local function PruneRecipeTreeNode(node, ctx)
+    local children = node:GetNodes()
+    local keptAnyRecipe = false
+    local keptDirectRecipe = false
+
+    for i = #children, 1, -1 do
+        local child = children[i]
+        local data = child:GetData()
+        if type(data) == "table" then
+            if data.recipeInfo then
+                local info = data.recipeInfo
+                local passes = RecipePassesMaterialsFilter(info, ctx)
+                if info.learned and info.recipeID then
+                    lastFilterCandidates[info.recipeID] = true
+                    lastFilterResults[info.recipeID] = passes
+                end
+                if passes then
+                    keptAnyRecipe = true
+                    keptDirectRecipe = true
+                else
+                    node:Remove(child, true)
+                end
+            elseif data.categoryInfo then
+                if PruneRecipeTreeNode(child, ctx) then
+                    keptAnyRecipe = true
+                else
+                    node:Remove(child, true)
+                end
+            end
+        end
+    end
+
+    -- Drop the spacer rows of categories that no longer list any recipes directly
+    if not keptDirectRecipe then
+        for i = #children, 1, -1 do
+            local data = children[i]:GetData()
+            if type(data) == "table" and (data.topPadding or data.bottomPadding) then
+                node:Remove(children[i], true)
+            end
+        end
+    end
+
+    return keptAnyRecipe
+end
+
+-- Filters the Recipes tab TreeDataProvider in place (called right after Blizzard assigns it)
+local function ApplyMaterialsFilterToDataProvider(dataProvider)
+    listBuiltWithFilter = materialsFilterEnabled
+    if not materialsFilterEnabled then return end
+    if type(dataProvider) ~= "table" or not dataProvider.GetRootNode or not dataProvider.Invalidate then return end
+    local root = dataProvider:GetRootNode()
+    if not root or not root.GetNodes then return end
+
+    EnsureProfessionItemMap()
+    wipe(lastFilterCandidates)
+    wipe(lastFilterResults)
+
+    local ok, err = pcall(function()
+        PruneRecipeTreeNode(root, NewMaterialsFilterContext())
+
+        -- Unlearned recipes are always filtered out, so the "Unlearned" divider is no longer needed
+        local rootChildren = root:GetNodes()
+        for i = #rootChildren, 1, -1 do
+            local data = rootChildren[i]:GetData()
+            if type(data) == "table" and data.isDivider then
+                root:Remove(rootChildren[i], true)
+            end
+        end
+    end)
+
+    dataProvider:Invalidate()
+
+    if not ok then
+        geterrorhandler()(err)
+    end
+end
+
+-- Returns the Recipes tab page if it exists
+local function GetCraftingPage()
+    return ProfessionsFrame and ProfessionsFrame.CraftingPage
+end
+
+-- Asks Blizzard to rebuild the Recipes tab list (our SetDataProvider hook re-applies the filter)
+local function RefreshNativeRecipeList()
+    local page = GetCraftingPage()
+    if not page or not page:IsVisible() or not page.Init then return end
+    if C_TradeSkillUI and C_TradeSkillUI.IsDataSourceChanging and C_TradeSkillUI.IsDataSourceChanging() then return end
+    if not Professions or not Professions.GetProfessionInfo then return end
+
+    local professionInfo = Professions.GetProfessionInfo()
+    if not professionInfo or not professionInfo.professionID or professionInfo.professionID == 0 then return end
+    page:Init(professionInfo)
+end
+
+local function UpdateFilterDropdownResetState()
+    local page = GetCraftingPage()
+    local dropdown = page and page.RecipeList and page.RecipeList.FilterDropdown
+    if dropdown and dropdown.ValidateResetState then
+        dropdown:ValidateResetState()
+    end
+end
+
+local function SetMaterialsFilterEnabled(enabled)
+    enabled = enabled and true or false
+    if materialsFilterEnabled == enabled then return end
+    materialsFilterEnabled = enabled
+    if not enabled then
+        wipe(lastFilterCandidates)
+        wipe(lastFilterResults)
+    end
+    -- Defer so the rebuild does not run inside the open filter menu's click handler
+    C_Timer.After(0, function()
+        RefreshNativeRecipeList()
+        UpdateFilterDropdownResetState()
+    end)
+end
+
+-- Toggles whether the filter counts character bank + Warband bank items (saved between sessions)
+local function SetFilterIncludesBank(include)
+    include = include and true or false
+    if filterIncludesBank == include then return end
+    filterIncludesBank = include
+    ReciPeekDB = ReciPeekDB or {}
+    ReciPeekDB.filterIncludeBank = include
+    if materialsFilterEnabled then
+        C_Timer.After(0, RefreshNativeRecipeList)
+    end
+end
+
+-- Returns true while the player is casting / repeating a craft
+local function IsPlayerCrafting()
+    if UnitCastingInfo and UnitCastingInfo("player") then return true end
+    if C_TradeSkillUI and C_TradeSkillUI.GetRecipeRepeatCount then
+        local ok, count = pcall(C_TradeSkillUI.GetRecipeRepeatCount)
+        if ok and type(count) == "number" and count > 0 then return true end
+    end
+    return false
+end
+
+-- Returns true if inventory changes would add or remove any recipe from the filtered list
+local function MaterialsFilterResultsChanged()
+    if not C_TradeSkillUI or not C_TradeSkillUI.GetRecipeInfo then return false end
+    EnsureProfessionItemMap()
+    local ctx = NewMaterialsFilterContext()
+    for recipeID in pairs(lastFilterCandidates) do
+        local info = C_TradeSkillUI.GetRecipeInfo(recipeID)
+        if info and RecipePassesMaterialsFilter(info, ctx) ~= (lastFilterResults[recipeID] or false) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Debounced re-check after bag changes; only rebuilds the list when its contents would change.
+-- Skipped mid-craft so Blizzard's reagent allocations are not reset; re-run on cast stop.
+local function ScheduleMaterialsFilterRecheck(delay)
+    if not materialsFilterEnabled or materialsFilterRecheckPending then return end
+    materialsFilterRecheckPending = true
+    C_Timer.After(delay or 0.4, function()
+        materialsFilterRecheckPending = false
+        if not materialsFilterEnabled then return end
+        local page = GetCraftingPage()
+        if not page or not page:IsVisible() then return end
+        if IsPlayerCrafting() then return end
+        if MaterialsFilterResultsChanged() then
+            RefreshNativeRecipeList()
+        end
+    end)
 end
 
 -- ============================================================================
@@ -1324,6 +1741,9 @@ local isProfessionsHooked = false
 local isCraftFormHooked = false
 local isOrderFormHooked = false
 local isOrderListHooked = false
+local isRecipeListHooked = false
+local isFilterDropdownHooked = false
+local isDefaultFiltersHooked = false
 
 local function TryHookProfessionsFrame()
     if not ProfessionsFrame then return end
@@ -1350,6 +1770,46 @@ local function TryHookProfessionsFrame()
         isCraftFormHooked = true
         hooksecurefunc(craftForm, "Init", function()
             C_Timer.After(0.02, UpdateMainSchematicFormIndicators)
+        end)
+    end
+
+    -- Recipes tab list: filter the tree right after Blizzard builds it (before it picks a selection)
+    local craftingPage = ProfessionsFrame.CraftingPage
+    local recipeList = craftingPage and craftingPage.RecipeList
+    if recipeList and recipeList.ScrollBox and recipeList.ScrollBox.SetDataProvider and not isRecipeListHooked then
+        isRecipeListHooked = true
+        hooksecurefunc(recipeList.ScrollBox, "SetDataProvider", function(_, dataProvider)
+            ApplyMaterialsFilterToDataProvider(dataProvider)
+        end)
+        craftingPage:HookScript("OnShow", function()
+            C_Timer.After(0.1, function()
+                if listBuiltWithFilter ~= materialsFilterEnabled then
+                    -- Filter was toggled (e.g. via /rp filter) while the Recipes tab was hidden
+                    RefreshNativeRecipeList()
+                else
+                    ScheduleMaterialsFilterRecheck(0)
+                end
+            end)
+        end)
+    end
+
+    -- Show the filter dropdown's reset (X) button while our filter is active
+    local filterDropdown = recipeList and recipeList.FilterDropdown
+    if filterDropdown and filterDropdown.SetIsDefaultCallback and not isFilterDropdownHooked then
+        isFilterDropdownHooked = true
+        local blizzardIsDefault = filterDropdown.isDefaultCallback
+        filterDropdown:SetIsDefaultCallback(function()
+            if materialsFilterEnabled then return false end
+            if blizzardIsDefault then return blizzardIsDefault() end
+            return true
+        end)
+    end
+
+    -- Blizzard's filter reset also clears ours
+    if Professions and Professions.SetDefaultFilters and not isDefaultFiltersHooked then
+        isDefaultFiltersHooked = true
+        hooksecurefunc(Professions, "SetDefaultFilters", function()
+            SetMaterialsFilterEnabled(false)
         end)
     end
 
@@ -1391,10 +1851,14 @@ eventFrame:RegisterEvent("BAG_UPDATE_DELAYED")
 eventFrame:RegisterEvent("CRAFTINGORDERS_CAN_REQUEST")
 eventFrame:RegisterEvent("CRAFTINGORDERS_ORDER_PLACEMENT_RESPONSE")
 eventFrame:RegisterEvent("GLOBAL_MOUSE_DOWN")
+eventFrame:RegisterEvent("UPDATE_TRADESKILL_CAST_STOPPED")
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
+            ReciPeekDB = ReciPeekDB or {}
+            if ReciPeekDB.filterIncludeBank == nil then ReciPeekDB.filterIncludeBank = true end
+            filterIncludesBank = ReciPeekDB.filterIncludeBank and true or false
             print("|cFF00CCFFReci|r|cFFFFD100Peek|r v1.2.0 loaded! Craftable reagents and Crafting Orders with combined materials on hand are highlighted in green.")
         elseif arg1 == "Blizzard_Professions" then
             TryHookProfessionsFrame()
@@ -1414,6 +1878,11 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         if peekFrame and peekFrame:IsShown() then
             RefreshPeekWindow()
         end
+        if event == "BAG_UPDATE_DELAYED" then
+            ScheduleMaterialsFilterRecheck()
+        end
+    elseif event == "UPDATE_TRADESKILL_CAST_STOPPED" then
+        ScheduleMaterialsFilterRecheck(0.5)
     elseif event == "GLOBAL_MOUSE_DOWN" then
         if arg1 ~= "LeftButton" then return end
         if IsShiftKeyDown() then return end -- Preserve Shift + Left-Click for chat item linking
@@ -1468,8 +1937,87 @@ if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall and Enum.Too
     end)
 end
 
+-- Filter Menu Hook: adds the ReciPeek materials filter to the Recipes tab's native Filter dropdown
+if Menu and Menu.ModifyMenu then
+    Menu.ModifyMenu("MENU_PROFESSIONS_FILTER", function(owner, rootDescription)
+        local page = GetCraftingPage()
+        local dropdown = page and page.RecipeList and page.RecipeList.FilterDropdown
+        if not dropdown or owner ~= dropdown then return end
+
+        local label = "Have Materials (incl. Sub-Crafts)"
+        local isChecked = function() return materialsFilterEnabled end
+        local onToggle = function() SetMaterialsFilterEnabled(not materialsFilterEnabled) end
+
+        local bankLabel = "Include Bank & Warband Bank"
+        local isBankChecked = function() return filterIncludesBank end
+        local onBankToggle = function() SetFilterIncludesBank(not filterIncludesBank) end
+
+        local checkbox, bankCheckbox
+        if MenuUtil and MenuUtil.CreateTitle and MenuUtil.CreateCheckbox and MenuUtil.CreateDivider and rootDescription.Insert then
+            -- Pin to the top of the menu: [ReciPeek] [filter] [bank] [divider] then Blizzard's filters
+            rootDescription:Insert(MenuUtil.CreateTitle("ReciPeek"), 1)
+            checkbox = rootDescription:Insert(MenuUtil.CreateCheckbox(label, isChecked, onToggle), 2)
+            bankCheckbox = rootDescription:Insert(MenuUtil.CreateCheckbox(bankLabel, isBankChecked, onBankToggle), 3)
+            rootDescription:Insert(MenuUtil.CreateDivider(), 4)
+        else
+            -- Fallback: append to the bottom
+            rootDescription:CreateDivider()
+            rootDescription:CreateTitle("ReciPeek")
+            checkbox = rootDescription:CreateCheckbox(label, isChecked, onToggle)
+            bankCheckbox = rootDescription:CreateCheckbox(bankLabel, isBankChecked, onBankToggle)
+        end
+
+        -- Indent the bank option so it reads as a sub-setting of the materials filter
+        if bankCheckbox and bankCheckbox.AddInitializer then
+            local SUB_OPTION_INDENT = 16
+            bankCheckbox:AddInitializer(function(button)
+                -- Runs after Blizzard's checkbox initializer; the label is anchored to the box, so it follows
+                if button.leftTexture1 then
+                    button.leftTexture1:SetPoint("LEFT", SUB_OPTION_INDENT, 0)
+                end
+                -- Invisible marker at the row's left edge so the menu's width measurement includes the indent
+                if button.AttachTexture then
+                    local spacer = button:AttachTexture()
+                    spacer:SetColorTexture(0, 0, 0, 0)
+                    spacer:SetSize(1, 1)
+                    spacer:SetPoint("LEFT")
+                end
+            end)
+        end
+
+        if bankCheckbox and bankCheckbox.SetTooltip then
+            bankCheckbox:SetTooltip(function(tooltip)
+                GameTooltip_SetTitle(tooltip, bankLabel)
+                GameTooltip_AddNormalLine(tooltip, "When checked, the Have Materials filter counts reagents in your character bank and Warband bank.")
+                GameTooltip_AddNormalLine(tooltip, "Uncheck to count only what you carry (bags and reagent bag).")
+                GameTooltip_AddNormalLine(tooltip, "|cFF888888Saved between sessions. Also toggled with /rp bank.|r")
+            end)
+        end
+
+        if checkbox and checkbox.SetTooltip then
+            checkbox:SetTooltip(function(tooltip)
+                GameTooltip_SetTitle(tooltip, "Have Materials (incl. Sub-Crafts)")
+                GameTooltip_AddNormalLine(tooltip, "Only show learned recipes you can craft right now, counting reagents you could craft first from the base materials you have.")
+                GameTooltip_AddNormalLine(tooltip, "All reagents share one pool, so a recipe needing two crafted reagents is hidden if you only have materials for one.")
+                GameTooltip_AddNormalLine(tooltip, "|cFF888888Bank and Warband bank are counted only if the option below is checked. Also toggled with /rp filter.|r")
+            end)
+        end
+    end)
+end
+
 -- Slash Command Handler (/rp or /recipeek)
-SlashCmdList["RECIPEEK"] = function()
+SlashCmdList["RECIPEEK"] = function(msg)
+    local cmd = strtrim(string.lower(msg or ""))
+    if cmd == "filter" then
+        SetMaterialsFilterEnabled(not materialsFilterEnabled)
+        print("|cFF00CCFFReciPeek:|r Have Materials (incl. Sub-Crafts) filter " .. (materialsFilterEnabled and "|cFF00FF66enabled|r" or "|cFFFF6666disabled|r") .. ".")
+        return
+    elseif cmd == "bank" then
+        SetFilterIncludesBank(not filterIncludesBank)
+        print("|cFF00CCFFReciPeek:|r Have Materials filter " .. (filterIncludesBank and "|cFF00FF66now counts|r" or "|cFFFF6666no longer counts|r") .. " bank and Warband bank items.")
+        return
+    end
+
     RebuildProfessionItemMap()
     UpdateMainSchematicFormIndicators()
     UpdateCraftingOrderBrowseListHighlights()
