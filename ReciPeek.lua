@@ -1,5 +1,5 @@
 -- ============================================================================
--- ReciPeek (v1.3.0)
+-- ReciPeek (v1.4.0)
 -- Author: Dantigravity
 -- Description: Tabbed reagent recipe inspector, custom quantity crafter, and
 --              availability highlighter for Recipes and Crafting Orders.
@@ -239,221 +239,6 @@ local function GetRecipeMaxCraftableCount(recipeID)
 end
 
 -- ============================================================================
--- CRAFTING ORDERS LIST: COMBINED MATERIALS (PATRON + PLAYER) HIGHLIGHTER
--- ============================================================================
-
--- Builds a lookup table of reagents provided by the customer/patron for an order
-local function ExtractCustomerProvidedMap(order)
-    local byItemID = {}
-
-    if not order or not order.reagents then
-        return byItemID
-    end
-
-    for _, r in ipairs(order.reagents) do
-        local isCustomer = true
-        if Enum and Enum.CraftingOrderReagentSource and Enum.CraftingOrderReagentSource.Crafter and r.source ~= nil then
-            if r.source == Enum.CraftingOrderReagentSource.Crafter then
-                isCustomer = false
-            end
-        end
-
-        if isCustomer then
-            local rInfo = r.reagentInfo or r.reagent or r
-            local nestedReagent = rInfo.reagent or r.reagent
-            local itemID = (nestedReagent and nestedReagent.itemID) or rInfo.itemID or r.itemID
-            local qty = rInfo.quantity or r.quantity or (nestedReagent and nestedReagent.quantity) or 0
-
-            if itemID and itemID > 0 and qty > 0 then
-                byItemID[itemID] = (byItemID[itemID] or 0) + qty
-            end
-        end
-    end
-
-    return byItemID
-end
-
--- Returns true if the order's recipe is learned and 100% of required reagents are available (Patron + Player)
-local function EvaluateOrderCombinedReadiness(order)
-    if not order then return false end
-    local recipeID = order.spellID or order.recipeID
-    if not recipeID or recipeID <= 0 then return false end
-
-    local rInfo = (C_TradeSkillUI and C_TradeSkillUI.GetRecipeInfo and C_TradeSkillUI.GetRecipeInfo(recipeID)) or recipeNameCache[recipeID]
-    if not rInfo or rInfo.learned == false then
-        return false
-    end
-
-    local schematic = C_TradeSkillUI and C_TradeSkillUI.GetRecipeSchematic and C_TradeSkillUI.GetRecipeSchematic(recipeID, false)
-    if not schematic or not schematic.reagentSlotSchematics then
-        return false
-    end
-
-    local customerByItemID = ExtractCustomerProvidedMap(order)
-
-    for _, slot in ipairs(schematic.reagentSlotSchematics) do
-        local isRequired = (slot.required ~= false) and (slot.reagentType == 1 or slot.reagentType == nil)
-        if isRequired and slot.reagents and #slot.reagents > 0 and (slot.quantityRequired or 0) > 0 then
-            local stillNeeded = slot.quantityRequired
-
-            -- 1. Subtract reagents provided by the patron/customer
-            for _, r in ipairs(slot.reagents) do
-                local id = r.itemID
-                if id and (customerByItemID[id] or 0) > 0 and stillNeeded > 0 then
-                    local useCustomerQty = math.min(stillNeeded, customerByItemID[id])
-                    customerByItemID[id] = customerByItemID[id] - useCustomerQty
-                    stillNeeded = stillNeeded - useCustomerQty
-                end
-            end
-
-            -- 2. Subtract remaining required reagents from the player's bags/bank
-            if stillNeeded > 0 then
-                for _, r in ipairs(slot.reagents) do
-                    local id = r and r.itemID
-                    if id and stillNeeded > 0 then
-                        local playerOwned = GetPlayerReagentCount(id)
-                        if playerOwned > 0 then
-                            local usePlayerQty = math.min(stillNeeded, playerOwned)
-                            stillNeeded = stillNeeded - usePlayerQty
-                        end
-                    end
-                end
-            end
-
-            if stillNeeded > 0 then
-                return false
-            end
-        end
-    end
-
-    return true
-end
-
--- Creates or retrieves the green row highlight overlay for a Crafting Order list row
-local function EnsureOrderRowHighlight(row)
-    if row.reciPeekOrderHighlight then return row.reciPeekOrderHighlight end
-
-    local hl = CreateFrame("Frame", nil, row, "BackdropTemplate")
-    hl:SetPoint("TOPLEFT", row, "TOPLEFT", 1, -1)
-    hl:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -1, 1)
-    hl:SetFrameLevel(math.max(1, row:GetFrameLevel()))
-    hl:EnableMouse(false)
-
-    -- Row background fill (RGBA: emerald green at 20% opacity)
-    local bg = hl:CreateTexture(nil, "BACKGROUND")
-    bg:SetAllPoints()
-    bg:SetColorTexture(0.04, 0.58, 0.22, 0.20)
-    hl.bg = bg
-
-    -- Left-edge accent bar (width: 3px)
-    local leftBar = hl:CreateTexture(nil, "OVERLAY")
-    leftBar:SetPoint("TOPLEFT", hl, "TOPLEFT", 0, 0)
-    leftBar:SetPoint("BOTTOMLEFT", hl, "BOTTOMLEFT", 0, 0)
-    leftBar:SetWidth(3)
-    leftBar:SetColorTexture(0.10, 1.00, 0.38, 0.95)
-    hl.leftBar = leftBar
-
-    -- Row outline border
-    hl:SetBackdrop({
-        edgeFile = "Interface\\Buttons\\WHITE8x8",
-        edgeSize = 1,
-    })
-    hl:SetBackdropBorderColor(0.15, 0.90, 0.40, 0.50)
-
-    row.reciPeekOrderHighlight = hl
-    return hl
-end
-
--- Extracts the CraftingOrderInfo table from a ScrollBox order row
-local function GetOrderInfoFromRow(row)
-    if not row then return nil end
-    if type(row.option) == "table" and (row.option.spellID or row.option.orderID) then
-        return row.option
-    end
-    if type(row.order) == "table" and (row.order.spellID or row.order.orderID) then
-        return row.order
-    end
-    if row.GetElementData then
-        local ok, elem = pcall(row.GetElementData, row)
-        if ok and type(elem) == "table" then
-            if type(elem.option) == "table" and (elem.option.spellID or elem.option.orderID) then
-                return elem.option
-            end
-            if type(elem.order) == "table" and (elem.order.spellID or elem.order.orderID) then
-                return elem.order
-            end
-            if elem.spellID or elem.orderID then
-                return elem
-            end
-        end
-    end
-    return nil
-end
-
--- Updates the highlight state for a single Crafting Order row
-local function UpdateSingleOrderRowHighlight(row)
-    if not row or not row:IsShown() then
-        if row and row.reciPeekOrderHighlight then
-            row.reciPeekOrderHighlight:Hide()
-        end
-        return
-    end
-
-    local order = GetOrderInfoFromRow(row)
-    if not order then
-        if row.reciPeekOrderHighlight then
-            row.reciPeekOrderHighlight:Hide()
-        end
-        return
-    end
-
-    if EvaluateOrderCombinedReadiness(order) then
-        local hl = EnsureOrderRowHighlight(row)
-        decoratedOrderRows[row] = true
-        hl:Show()
-    elseif row.reciPeekOrderHighlight then
-        row.reciPeekOrderHighlight:Hide()
-    end
-end
-
--- Refreshes highlights across all visible rows in the Crafting Orders BrowseFrame ScrollBox
-local function UpdateCraftingOrderBrowseListHighlights()
-    if not ProfessionsFrame or not ProfessionsFrame:IsShown() or not ProfessionsFrame.OrdersPage then
-        return
-    end
-
-    local browseFrame = ProfessionsFrame.OrdersPage.BrowseFrame
-    local orderList = browseFrame and browseFrame.OrderList
-    local scrollBox = orderList and orderList.ScrollBox
-
-    if not scrollBox or not scrollBox:IsShown() then
-        for row in pairs(decoratedOrderRows) do
-            if row.reciPeekOrderHighlight then
-                row.reciPeekOrderHighlight:Hide()
-            end
-        end
-        return
-    end
-
-    if not next(itemToRecipeMap) then
-        RebuildProfessionItemMap()
-    end
-
-    if scrollBox.GetFrames then
-        local frames = scrollBox:GetFrames()
-        if frames then
-            for _, row in ipairs(frames) do
-                UpdateSingleOrderRowHighlight(row)
-            end
-        end
-    elseif scrollBox.ForEachFrame then
-        scrollBox:ForEachFrame(function(row)
-            UpdateSingleOrderRowHighlight(row)
-        end)
-    end
-end
-
--- ============================================================================
 -- RECIPES TAB FILTER: "HAVE MATERIALS (INCL. SUB-CRAFTS)"
 -- ----------------------------------------------------------------------------
 -- Hides every recipe the player cannot craft right now, counting reagents they
@@ -467,7 +252,6 @@ local BASIC_REAGENT_TYPE = (Enum and Enum.CraftingReagentType and Enum.CraftingR
 local SALVAGE_RECIPE_TYPE = Enum and Enum.TradeskillRecipeType and Enum.TradeskillRecipeType.Salvage
 
 local materialsFilterEnabled = false
-local filterIncludesBank = true    -- saved in ReciPeekDB.filterIncludeBank; loaded on ADDON_LOADED
 local materialsFilterRecheckPending = false
 local listBuiltWithFilter = false  -- whether the currently displayed list was built with the filter on
 local lastFilterCandidates = {}   -- recipeID -> true for every learned recipe in the last unfiltered list
@@ -518,21 +302,13 @@ local function GetRecipeRequirements(recipeID)
     return req
 end
 
--- Returns the on-hand count of a reagent (item or currency), cached for the current filter pass
+-- Returns the on-hand count of a reagent (item or currency), cached for the current filter pass.
+-- Items count bags, reagent bag, character bank and Warband bank, since crafting draws from all of them.
 local function GetFilterReagentCount(ctx, reagent)
     local count = ctx.counts[reagent.key]
     if count == nil then
         if reagent.itemID then
-            if filterIncludesBank then
-                count = GetPlayerReagentCount(reagent.itemID)
-            elseif C_Item and C_Item.GetItemCount then
-                -- Bags only (backpack, equipped bags and reagent bag); excludes character and Warband bank
-                count = C_Item.GetItemCount(reagent.itemID, false, false, false, false) or 0
-            elseif GetItemCount then
-                count = GetItemCount(reagent.itemID, false) or 0
-            else
-                count = 0
-            end
+            count = GetPlayerReagentCount(reagent.itemID)
         elseif reagent.currencyID and C_CurrencyInfo and C_CurrencyInfo.GetCurrencyInfo then
             local info = C_CurrencyInfo.GetCurrencyInfo(reagent.currencyID)
             count = (info and info.quantity) or 0
@@ -641,11 +417,8 @@ local function RecipePassesMaterialsFilter(recipeInfo, ctx)
     local cached = ctx.results[listRecipeID]
     if cached ~= nil then return cached end
 
-    -- Blizzard's numAvailable counts bank items, so it can only be trusted when the bank is included
-    local trustBlizzardCount = filterIncludesBank
-
     local result = false
-    if trustBlizzardCount and (recipeInfo.numAvailable or 0) > 0 then
+    if (recipeInfo.numAvailable or 0) > 0 then
         -- Blizzard already confirms the materials are on hand
         result = true
     else
@@ -655,7 +428,7 @@ local function RecipePassesMaterialsFilter(recipeInfo, ctx)
             craftInfo = Professions.GetHighestLearnedRecipe(recipeInfo) or recipeInfo
         end
 
-        if trustBlizzardCount and craftInfo ~= recipeInfo and (craftInfo.numAvailable or 0) > 0 then
+        if craftInfo ~= recipeInfo and (craftInfo.numAvailable or 0) > 0 then
             result = true
         else
             local req = GetRecipeRequirements(craftInfo.recipeID)
@@ -793,18 +566,6 @@ local function SetMaterialsFilterEnabled(enabled)
     end)
 end
 
--- Toggles whether the filter counts character bank + Warband bank items (saved between sessions)
-local function SetFilterIncludesBank(include)
-    include = include and true or false
-    if filterIncludesBank == include then return end
-    filterIncludesBank = include
-    ReciPeekDB = ReciPeekDB or {}
-    ReciPeekDB.filterIncludeBank = include
-    if materialsFilterEnabled then
-        C_Timer.After(0, RefreshNativeRecipeList)
-    end
-end
-
 -- Returns true while the player is casting / repeating a craft
 local function IsPlayerCrafting()
     if UnitCastingInfo and UnitCastingInfo("player") then return true end
@@ -842,6 +603,437 @@ local function ScheduleMaterialsFilterRecheck(delay)
         if IsPlayerCrafting() then return end
         if MaterialsFilterResultsChanged() then
             RefreshNativeRecipeList()
+        end
+    end)
+end
+
+-- ============================================================================
+-- CRAFTING ORDERS: COMBINED MATERIALS (CUSTOMER + PLAYER) HIGHLIGHT & FILTER
+-- ----------------------------------------------------------------------------
+-- An order row turns green when the customer's reagents plus the player's own
+-- cover it right now, and teal when they cover it once the player crafts some
+-- reagents first from base materials on hand (same shared pool as the Recipes
+-- filter). The "Have Materials" option in the Crafting Orders tab's Filter menu
+-- hides every other order.
+-- ============================================================================
+
+local ORDERS_FILTER_MAX_AUTO_REQUESTS = 20  -- extra result pages fetched per search while the filter hides rows
+local ORDERS_FILTER_MIN_ROWS = 12           -- keep fetching pages while fewer rows than this are shown
+
+local ordersFilterEnabled = false
+local ordersFilterRecheckPending = false
+local ordersListBuiltWithFilter = false  -- whether the currently displayed order list was built with the filter on
+local ordersAutoRequestCount = 0
+local lastShownOrdersBucketed = nil      -- nil: nothing shown; true: recipe buckets; false: individual orders
+local lastOrdersFilterResults = {}       -- order/bucket table -> boolean verdict from the last filter pass
+local ordersRangeCallbackOwner = {}
+local lastOrdersFilterError = nil        -- error text from the last filter pass, shown by /rp why
+
+-- Builds a lookup table of reagents provided by the customer for an order
+local function ExtractCustomerProvidedMap(order)
+    local byItemID = {}
+
+    if not order or not order.reagents then
+        return byItemID
+    end
+
+    for _, r in ipairs(order.reagents) do
+        local isCustomer = true
+        if Enum and Enum.CraftingOrderReagentSource and Enum.CraftingOrderReagentSource.Crafter and r.source ~= nil then
+            if r.source == Enum.CraftingOrderReagentSource.Crafter then
+                isCustomer = false
+            end
+        end
+
+        if isCustomer then
+            local rInfo = r.reagentInfo or r.reagent or r
+            local nestedReagent = rInfo.reagent or r.reagent
+            local itemID = (nestedReagent and nestedReagent.itemID) or rInfo.itemID or r.itemID
+            local qty = rInfo.quantity or r.quantity or (nestedReagent and nestedReagent.quantity) or 0
+
+            if itemID and itemID > 0 and qty > 0 then
+                byItemID[itemID] = (byItemID[itemID] or 0) + qty
+            end
+        end
+    end
+
+    return byItemID
+end
+
+-- Returns "direct" if the customer's plus the player's materials cover the order right now,
+-- "subcraft" if they cover it once missing reagents are crafted from base materials on hand,
+-- or false. Bucket rows (public orders grouped by recipe) carry no customer reagents.
+local function EvaluateOrderReadiness(order, ctx)
+    if type(order) ~= "table" then return false end
+    local recipeID = order.spellID or order.recipeID
+    if not recipeID or recipeID <= 0 then return false end
+
+    local rInfo = (C_TradeSkillUI and C_TradeSkillUI.GetRecipeInfo and C_TradeSkillUI.GetRecipeInfo(recipeID)) or recipeNameCache[recipeID]
+    if not rInfo or rInfo.learned == false then return false end
+
+    local req = GetRecipeRequirements(recipeID)
+    if not req or req.isSalvage or not req.evaluable then return false end
+
+    ctx = ctx or NewMaterialsFilterContext()
+    local customer = ExtractCustomerProvidedMap(order)
+
+    -- Everything usable for this order: the player's stock plus what the customer supplied
+    local function SeedPool()
+        local pool = {}
+        for _, slot in ipairs(req.slots) do
+            for _, r in ipairs(slot.reagents) do
+                if pool[r.key] == nil then
+                    pool[r.key] = GetFilterReagentCount(ctx, r) + ((r.itemID and customer[r.itemID]) or 0)
+                end
+            end
+        end
+        return pool
+    end
+
+    -- 1. Covered by materials on hand (any accepted quality tier / variant)
+    local pool = SeedPool()
+    local direct = true
+    for _, slot in ipairs(req.slots) do
+        local need = slot.quantity
+        for _, r in ipairs(slot.reagents) do
+            if need <= 0 then break end
+            local use = math.min(pool[r.key], need)
+            pool[r.key] = pool[r.key] - use
+            need = need - use
+        end
+        if need > 0 then
+            direct = false
+            break
+        end
+    end
+    if direct then return "direct" end
+
+    -- 2. Covered once the shortfall is crafted from base materials (one shared pool, like the Recipes filter)
+    if ReserveCraftMaterials(recipeID, 1, SeedPool(), ctx, 0, {}) then
+        return "subcraft"
+    end
+    return false
+end
+
+-- Row colors: green = ready now, teal = ready after crafting some reagents first
+local ORDER_HIGHLIGHT_STYLES = {
+    direct = {
+        bg     = { 0.04, 0.58, 0.22, 0.20 },
+        bar    = { 0.10, 1.00, 0.38, 0.95 },
+        border = { 0.15, 0.90, 0.40, 0.50 },
+    },
+    subcraft = {
+        bg     = { 0.03, 0.42, 0.46, 0.20 },
+        bar    = { 0.20, 0.88, 0.90, 0.95 },
+        border = { 0.22, 0.80, 0.84, 0.50 },
+    },
+}
+
+-- Creates or retrieves the row highlight overlay for a Crafting Order list row
+local function EnsureOrderRowHighlight(row)
+    if row.reciPeekOrderHighlight then return row.reciPeekOrderHighlight end
+
+    local hl = CreateFrame("Frame", nil, row, "BackdropTemplate")
+    hl:SetPoint("TOPLEFT", row, "TOPLEFT", 1, -1)
+    hl:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -1, 1)
+    hl:SetFrameLevel(math.max(1, row:GetFrameLevel()))
+    hl:EnableMouse(false)
+
+    -- Row background fill
+    local bg = hl:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    hl.bg = bg
+
+    -- Left-edge accent bar (width: 3px)
+    local leftBar = hl:CreateTexture(nil, "OVERLAY")
+    leftBar:SetPoint("TOPLEFT", hl, "TOPLEFT", 0, 0)
+    leftBar:SetPoint("BOTTOMLEFT", hl, "BOTTOMLEFT", 0, 0)
+    leftBar:SetWidth(3)
+    hl.leftBar = leftBar
+
+    -- Row outline border
+    hl:SetBackdrop({
+        edgeFile = "Interface\\Buttons\\WHITE8x8",
+        edgeSize = 1,
+    })
+
+    row.reciPeekOrderHighlight = hl
+    return hl
+end
+
+local function ApplyOrderHighlightStyle(hl, state)
+    local style = ORDER_HIGHLIGHT_STYLES[state] or ORDER_HIGHLIGHT_STYLES.direct
+    if hl.reciPeekState == state then return end
+    hl.reciPeekState = state
+    hl.bg:SetColorTexture(unpack(style.bg))
+    hl.leftBar:SetColorTexture(unpack(style.bar))
+    hl:SetBackdropBorderColor(unpack(style.border))
+end
+
+-- Extracts the CraftingOrderInfo table from a ScrollBox order row
+local function GetOrderInfoFromRow(row)
+    if not row then return nil end
+    if type(row.option) == "table" and (row.option.spellID or row.option.orderID) then
+        return row.option
+    end
+    if type(row.order) == "table" and (row.order.spellID or row.order.orderID) then
+        return row.order
+    end
+    if row.GetElementData then
+        local ok, elem = pcall(row.GetElementData, row)
+        if ok and type(elem) == "table" then
+            if type(elem.option) == "table" and (elem.option.spellID or elem.option.orderID) then
+                return elem.option
+            end
+            if type(elem.order) == "table" and (elem.order.spellID or elem.order.orderID) then
+                return elem.order
+            end
+            if elem.spellID or elem.orderID then
+                return elem
+            end
+        end
+    end
+    return nil
+end
+
+-- Updates the highlight state for a single Crafting Order row
+local function UpdateSingleOrderRowHighlight(row, ctx)
+    if not row or not row:IsShown() then
+        if row and row.reciPeekOrderHighlight then
+            row.reciPeekOrderHighlight:Hide()
+        end
+        return
+    end
+
+    local order = GetOrderInfoFromRow(row)
+    local state = order and EvaluateOrderReadiness(order, ctx)
+    if state then
+        local hl = EnsureOrderRowHighlight(row)
+        ApplyOrderHighlightStyle(hl, state)
+        decoratedOrderRows[row] = true
+        hl:Show()
+    elseif row.reciPeekOrderHighlight then
+        row.reciPeekOrderHighlight:Hide()
+    end
+end
+
+local function GetOrdersPage()
+    return ProfessionsFrame and ProfessionsFrame.OrdersPage
+end
+
+-- Returns the Crafting Orders tab's order list ScrollBox and its parent list frame
+local function GetOrdersScrollBox()
+    local page = GetOrdersPage()
+    local orderList = page and page.BrowseFrame and page.BrowseFrame.OrderList
+    return orderList and orderList.ScrollBox, orderList
+end
+
+-- Refreshes highlights across all visible rows in the Crafting Orders BrowseFrame ScrollBox
+local function UpdateCraftingOrderBrowseListHighlights()
+    if not ProfessionsFrame or not ProfessionsFrame:IsShown() or not ProfessionsFrame.OrdersPage then
+        return
+    end
+
+    local scrollBox = GetOrdersScrollBox()
+    if not scrollBox or not scrollBox:IsShown() then
+        for row in pairs(decoratedOrderRows) do
+            if row.reciPeekOrderHighlight then
+                row.reciPeekOrderHighlight:Hide()
+            end
+        end
+        return
+    end
+
+    if not next(itemToRecipeMap) then
+        RebuildProfessionItemMap()
+    end
+
+    local ctx = NewMaterialsFilterContext()
+    if scrollBox.GetFrames then
+        local frames = scrollBox:GetFrames()
+        if frames then
+            for _, row in ipairs(frames) do
+                UpdateSingleOrderRowHighlight(row, ctx)
+            end
+        end
+    elseif scrollBox.ForEachFrame then
+        scrollBox:ForEachFrame(function(row)
+            UpdateSingleOrderRowHighlight(row, ctx)
+        end)
+    end
+end
+
+-- Filter verdict for one list row. A bucket (public orders grouped by recipe) can't be judged,
+-- since each order inside brings its own reagents, so it stays unless the recipe is unlearned;
+-- opening it lists its orders, and those are filtered.
+local function OrderPassesFilter(option, ctx)
+    if type(option) ~= "table" then return true end
+    if not option.orderID then
+        local recipeID = option.spellID
+        local rInfo = recipeID and C_TradeSkillUI and C_TradeSkillUI.GetRecipeInfo and C_TradeSkillUI.GetRecipeInfo(recipeID)
+        return not (rInfo and rInfo.learned == false)
+    end
+    return EvaluateOrderReadiness(option, ctx) and true or false
+end
+
+-- Fetches another page of orders while the filter leaves the list short or the player scrolls
+-- near its end. Blizzard's own paging counts the hidden rows, so on its own it stops too early.
+local function MaybeRequestMoreOrders()
+    if not ordersFilterEnabled then return end
+    local page = GetOrdersPage()
+    local scrollBox = GetOrdersScrollBox()
+    if not page or not scrollBox or not scrollBox:IsVisible() then return end
+    if not page.expectMoreRows or page.requestCallback or not page.RequestMoreOrders then return end
+    if ordersAutoRequestCount >= ORDERS_FILTER_MAX_AUTO_REQUESTS then return end
+
+    local dataProvider = scrollBox.GetDataProvider and scrollBox:GetDataProvider()
+    local shown = (dataProvider and dataProvider.GetSize and dataProvider:GetSize()) or 0
+    local nearEnd = shown < ORDERS_FILTER_MIN_ROWS
+    if not nearEnd and scrollBox.HasScrollableExtent and not scrollBox:HasScrollableExtent() then
+        nearEnd = true
+    end
+    if not nearEnd and scrollBox.GetScrollPercentage and scrollBox:GetScrollPercentage() >= 0.85 then
+        nearEnd = true
+    end
+    if not nearEnd then return end
+
+    ordersAutoRequestCount = ordersAutoRequestCount + 1
+    local ok, err = pcall(page.RequestMoreOrders, page)
+    if not ok then geterrorhandler()(err) end
+end
+
+-- Removes rows that fail the filter from the order list (runs right after Blizzard's ShowGeneric fills it)
+local function ApplyOrdersFilterToList(orders, offset)
+    local isFirstPage = (offset or 0) == 0
+    if isFirstPage then
+        ordersAutoRequestCount = 0
+        wipe(lastOrdersFilterResults)
+        if type(orders) == "table" and orders[1] then
+            lastShownOrdersBucketed = (orders[1].orderID == nil)
+        else
+            lastShownOrdersBucketed = nil
+        end
+    end
+    ordersListBuiltWithFilter = ordersFilterEnabled
+    if not ordersFilterEnabled then return end
+
+    local scrollBox, orderList = GetOrdersScrollBox()
+    local dataProvider = scrollBox and scrollBox.GetDataProvider and scrollBox:GetDataProvider()
+    if not dataProvider or not dataProvider.Enumerate then return end
+
+    EnsureProfessionItemMap()
+    local ctx = NewMaterialsFilterContext()
+
+    local ok, err = pcall(function()
+        local drop, dropList = {}, {}
+        for _, elem in dataProvider:Enumerate() do
+            local option = type(elem) == "table" and elem.option
+            local passed = OrderPassesFilter(option, ctx)
+            if type(option) == "table" then
+                lastOrdersFilterResults[option] = passed
+            end
+            if not passed then
+                drop[elem] = true
+                table.insert(dropList, elem)
+            end
+        end
+
+        -- Hand the list a new provider holding only the passing rows (removing rows from Blizzard's
+        -- provider in place did not refresh the list). Later result pages are inserted into this one.
+        if #dropList > 0 then
+            local kept = {}
+            for _, elem in dataProvider:Enumerate() do
+                if not drop[elem] then
+                    table.insert(kept, elem)
+                end
+            end
+            local retain = ScrollBoxConstants and ScrollBoxConstants.RetainScrollPosition
+            scrollBox:SetDataProvider(CreateDataProvider(kept), retain)
+            dataProvider = scrollBox:GetDataProvider()
+
+            for _, elem in dataProvider:Enumerate() do
+                if drop[elem] then
+                    error("ReciPeek: filtered orders are still in the list after rebuilding it")
+                end
+            end
+        end
+        lastOrdersFilterError = nil
+
+        -- Blizzard only shows its "no orders" text when the server sent none
+        local remaining = dataProvider.GetSize and dataProvider:GetSize() or 1
+        if remaining == 0 and orderList and orderList.ResultsText and type(orders) == "table" and #orders > 0 then
+            orderList.ResultsText:SetText("No orders you have the materials for.\n|cFF888888Turn off ReciPeek's Have Materials filter to see every order.|r")
+            orderList.ResultsText:Show()
+        end
+    end)
+
+    if not ok then
+        lastOrdersFilterError = tostring(err)
+        geterrorhandler()(err)
+    end
+
+    C_Timer.After(0, MaybeRequestMoreOrders)
+end
+
+-- Rebuilds the order list from the results Blizzard already holds (no new server request)
+local function RefreshNativeOrdersList()
+    local page = GetOrdersPage()
+    if not page or not page.BrowseFrame or not page.BrowseFrame:IsVisible() then return end
+    if page.requestCallback then return end  -- a request is in flight; its results get filtered on arrival
+
+    local ok, err = true, nil
+    if lastShownOrdersBucketed == true and page.ShowBuckets then
+        ok, err = pcall(page.ShowBuckets, page, 0, false)
+    elseif lastShownOrdersBucketed == false and page.ShowOrders then
+        ok, err = pcall(page.ShowOrders, page, 0, false)
+    end
+    if not ok then geterrorhandler()(err) end
+end
+
+local function UpdateOrdersFilterDropdownResetState()
+    local page = GetOrdersPage()
+    local dropdown = page and page.BrowseFrame and page.BrowseFrame.RecipeList and page.BrowseFrame.RecipeList.FilterDropdown
+    if dropdown and dropdown.ValidateResetState then
+        dropdown:ValidateResetState()
+    end
+end
+
+local function SetOrdersFilterEnabled(enabled)
+    enabled = enabled and true or false
+    if ordersFilterEnabled == enabled then return end
+    ordersFilterEnabled = enabled
+    -- Defer so the rebuild does not run inside the open filter menu's click handler
+    C_Timer.After(0, function()
+        RefreshNativeOrdersList()
+        UpdateOrdersFilterDropdownResetState()
+    end)
+end
+
+-- Returns true if inventory changes would add or remove any row from the filtered order list
+local function OrdersFilterResultsChanged()
+    if not next(lastOrdersFilterResults) then return false end
+    EnsureProfessionItemMap()
+    local ctx = NewMaterialsFilterContext()
+    for option, passed in pairs(lastOrdersFilterResults) do
+        if OrderPassesFilter(option, ctx) ~= passed then
+            return true
+        end
+    end
+    return false
+end
+
+-- Debounced re-check after bag changes; only rebuilds the order list when its contents would change
+local function ScheduleOrdersFilterRecheck(delay)
+    if not ordersFilterEnabled or ordersFilterRecheckPending then return end
+    ordersFilterRecheckPending = true
+    C_Timer.After(delay or 0.4, function()
+        ordersFilterRecheckPending = false
+        if not ordersFilterEnabled then return end
+        local page = GetOrdersPage()
+        if not page or not page.BrowseFrame or not page.BrowseFrame:IsVisible() then return end
+        if IsPlayerCrafting() then return end
+        if OrdersFilterResultsChanged() then
+            RefreshNativeOrdersList()
         end
     end)
 end
@@ -1744,6 +1936,18 @@ local isOrderListHooked = false
 local isRecipeListHooked = false
 local isFilterDropdownHooked = false
 local isDefaultFiltersHooked = false
+local isOrdersShowHooked = false
+local isOrdersFilterDropdownHooked = false
+
+-- Makes a filter dropdown show its reset (X) button while one of our filters is active
+local function HookFilterDropdownResetState(dropdown, isOurFilterActive)
+    local blizzardIsDefault = dropdown.isDefaultCallback
+    dropdown:SetIsDefaultCallback(function()
+        if isOurFilterActive() then return false end
+        if blizzardIsDefault then return blizzardIsDefault() end
+        return true
+    end)
+end
 
 local function TryHookProfessionsFrame()
     if not ProfessionsFrame then return end
@@ -1797,19 +2001,15 @@ local function TryHookProfessionsFrame()
     local filterDropdown = recipeList and recipeList.FilterDropdown
     if filterDropdown and filterDropdown.SetIsDefaultCallback and not isFilterDropdownHooked then
         isFilterDropdownHooked = true
-        local blizzardIsDefault = filterDropdown.isDefaultCallback
-        filterDropdown:SetIsDefaultCallback(function()
-            if materialsFilterEnabled then return false end
-            if blizzardIsDefault then return blizzardIsDefault() end
-            return true
-        end)
+        HookFilterDropdownResetState(filterDropdown, function() return materialsFilterEnabled end)
     end
 
-    -- Blizzard's filter reset also clears ours
+    -- Blizzard's filter reset (from either tab) also clears ours
     if Professions and Professions.SetDefaultFilters and not isDefaultFiltersHooked then
         isDefaultFiltersHooked = true
         hooksecurefunc(Professions, "SetDefaultFilters", function()
             SetMaterialsFilterEnabled(false)
+            SetOrdersFilterEnabled(false)
         end)
     end
 
@@ -1821,12 +2021,44 @@ local function TryHookProfessionsFrame()
         end)
     end
 
-    local browseFrame = ProfessionsFrame.OrdersPage and ProfessionsFrame.OrdersPage.BrowseFrame
+    local ordersPage = ProfessionsFrame.OrdersPage
+    local browseFrame = ordersPage and ordersPage.BrowseFrame
     local orderList = browseFrame and browseFrame.OrderList
     local scrollBox = orderList and orderList.ScrollBox
 
+    -- Crafting Orders list: filter the rows right after Blizzard fills them (first page and each extra page)
+    if ordersPage and ordersPage.ShowGeneric and browseFrame and not isOrdersShowHooked then
+        isOrdersShowHooked = true
+        hooksecurefunc(ordersPage, "ShowGeneric", function(_, orders, _, offset)
+            ApplyOrdersFilterToList(orders, offset)
+        end)
+        browseFrame:HookScript("OnShow", function()
+            C_Timer.After(0.1, function()
+                if ordersListBuiltWithFilter ~= ordersFilterEnabled then
+                    -- Filter was toggled (e.g. via /rp orders) while the order list was hidden
+                    RefreshNativeOrdersList()
+                else
+                    ScheduleOrdersFilterRecheck(0)
+                end
+            end)
+        end)
+    end
+
+    local ordersFilterDropdown = browseFrame and browseFrame.RecipeList and browseFrame.RecipeList.FilterDropdown
+    if ordersFilterDropdown and ordersFilterDropdown.SetIsDefaultCallback and not isOrdersFilterDropdownHooked then
+        isOrdersFilterDropdownHooked = true
+        HookFilterDropdownResetState(ordersFilterDropdown, function() return ordersFilterEnabled end)
+    end
+
     if scrollBox and not isOrderListHooked then
         isOrderListHooked = true
+
+        -- Blizzard fetches the next page based on rows it added, not rows still shown, so check again on scroll
+        if scrollBox.RegisterCallback and ScrollBoxListMixin and ScrollBoxListMixin.Event and ScrollBoxListMixin.Event.OnDataRangeChanged then
+            scrollBox:RegisterCallback(ScrollBoxListMixin.Event.OnDataRangeChanged, function()
+                if ordersFilterEnabled then C_Timer.After(0, MaybeRequestMoreOrders) end
+            end, ordersRangeCallbackOwner)
+        end
 
         if ScrollUtil and ScrollUtil.AddInitializedFrameCallback then
             ScrollUtil.AddInitializedFrameCallback(scrollBox, function(row)
@@ -1857,9 +2089,9 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
             ReciPeekDB = ReciPeekDB or {}
-            if ReciPeekDB.filterIncludeBank == nil then ReciPeekDB.filterIncludeBank = true end
-            filterIncludesBank = ReciPeekDB.filterIncludeBank and true or false
-            print("|cFF00CCFFReci|r|cFFFFD100Peek|r v1.2.0 loaded! Craftable reagents and Crafting Orders with combined materials on hand are highlighted in green.")
+            ReciPeekDB.filterIncludeBank = nil  -- old "Include Bank" setting (removed); drop the stale saved value
+            local version = C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(ADDON_NAME, "Version")
+            print("|cFF00CCFFReci|r|cFFFFD100Peek|r " .. (version and ("v" .. version .. " ") or "") .. "loaded! Craftable reagents and Crafting Orders with combined materials on hand are highlighted in green.")
         elseif arg1 == "Blizzard_Professions" then
             TryHookProfessionsFrame()
         end
@@ -1880,9 +2112,11 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         end
         if event == "BAG_UPDATE_DELAYED" then
             ScheduleMaterialsFilterRecheck()
+            ScheduleOrdersFilterRecheck()
         end
     elseif event == "UPDATE_TRADESKILL_CAST_STOPPED" then
         ScheduleMaterialsFilterRecheck(0.5)
+        ScheduleOrdersFilterRecheck(0.5)
     elseif event == "GLOBAL_MOUSE_DOWN" then
         if arg1 ~= "LeftButton" then return end
         if IsShiftKeyDown() then return end -- Preserve Shift + Left-Click for chat item linking
@@ -1937,72 +2171,141 @@ if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall and Enum.Too
     end)
 end
 
--- Filter Menu Hook: adds the ReciPeek materials filter to the Recipes tab's native Filter dropdown
+-- Filter Menu Hook: adds the ReciPeek materials filter to the native Filter dropdown of the
+-- Recipes tab and of the Crafting Orders tab (both use the same menu)
 if Menu and Menu.ModifyMenu then
     Menu.ModifyMenu("MENU_PROFESSIONS_FILTER", function(owner, rootDescription)
-        local page = GetCraftingPage()
-        local dropdown = page and page.RecipeList and page.RecipeList.FilterDropdown
-        if not dropdown or owner ~= dropdown then return end
+        local craftingPage = GetCraftingPage()
+        local recipesDropdown = craftingPage and craftingPage.RecipeList and craftingPage.RecipeList.FilterDropdown
+        local ordersPage = GetOrdersPage()
+        local ordersBrowse = ordersPage and ordersPage.BrowseFrame
+        local ordersDropdown = ordersBrowse and ordersBrowse.RecipeList and ordersBrowse.RecipeList.FilterDropdown
 
         local label = "Have Materials (incl. Sub-Crafts)"
-        local isChecked = function() return materialsFilterEnabled end
-        local onToggle = function() SetMaterialsFilterEnabled(not materialsFilterEnabled) end
+        local isChecked, onToggle, tooltipLines
+        if recipesDropdown and owner == recipesDropdown then
+            isChecked = function() return materialsFilterEnabled end
+            onToggle = function() SetMaterialsFilterEnabled(not materialsFilterEnabled) end
+            tooltipLines = {
+                "Only show learned recipes you can craft right now, counting reagents you could craft first from the base materials you have.",
+                "All reagents share one pool, so a recipe needing two crafted reagents is hidden if you only have materials for one.",
+                "|cFF888888Counts your bags, reagent bag, bank and Warband bank, like crafting does. Also toggled with /rp filter.|r",
+            }
+        elseif ordersDropdown and owner == ordersDropdown then
+            isChecked = function() return ordersFilterEnabled end
+            onToggle = function() SetOrdersFilterEnabled(not ordersFilterEnabled) end
+            tooltipLines = {
+                "Only show orders you can fill right now with the customer's reagents plus your own, counting reagents you could craft first from the base materials you have.",
+                "|cFF00FF66Green|r rows are ready now. |cFF33E0E6Teal|r rows need some reagents crafted first.",
+                "Public orders grouped by recipe stay listed; open one to see only the orders you can fill.",
+                "|cFF888888Counts your bags, reagent bag, bank and Warband bank, like crafting does. Also toggled with /rp orders.|r",
+            }
+        else
+            return
+        end
 
-        local bankLabel = "Include Bank & Warband Bank"
-        local isBankChecked = function() return filterIncludesBank end
-        local onBankToggle = function() SetFilterIncludesBank(not filterIncludesBank) end
-
-        local checkbox, bankCheckbox
+        local checkbox
         if MenuUtil and MenuUtil.CreateTitle and MenuUtil.CreateCheckbox and MenuUtil.CreateDivider and rootDescription.Insert then
-            -- Pin to the top of the menu: [ReciPeek] [filter] [bank] [divider] then Blizzard's filters
+            -- Pin to the top of the menu: [ReciPeek] [filter] [divider] then Blizzard's filters
             rootDescription:Insert(MenuUtil.CreateTitle("ReciPeek"), 1)
             checkbox = rootDescription:Insert(MenuUtil.CreateCheckbox(label, isChecked, onToggle), 2)
-            bankCheckbox = rootDescription:Insert(MenuUtil.CreateCheckbox(bankLabel, isBankChecked, onBankToggle), 3)
-            rootDescription:Insert(MenuUtil.CreateDivider(), 4)
+            rootDescription:Insert(MenuUtil.CreateDivider(), 3)
         else
             -- Fallback: append to the bottom
             rootDescription:CreateDivider()
             rootDescription:CreateTitle("ReciPeek")
             checkbox = rootDescription:CreateCheckbox(label, isChecked, onToggle)
-            bankCheckbox = rootDescription:CreateCheckbox(bankLabel, isBankChecked, onBankToggle)
-        end
-
-        -- Indent the bank option so it reads as a sub-setting of the materials filter
-        if bankCheckbox and bankCheckbox.AddInitializer then
-            local SUB_OPTION_INDENT = 16
-            bankCheckbox:AddInitializer(function(button)
-                -- Runs after Blizzard's checkbox initializer; the label is anchored to the box, so it follows
-                if button.leftTexture1 then
-                    button.leftTexture1:SetPoint("LEFT", SUB_OPTION_INDENT, 0)
-                end
-                -- Invisible marker at the row's left edge so the menu's width measurement includes the indent
-                if button.AttachTexture then
-                    local spacer = button:AttachTexture()
-                    spacer:SetColorTexture(0, 0, 0, 0)
-                    spacer:SetSize(1, 1)
-                    spacer:SetPoint("LEFT")
-                end
-            end)
-        end
-
-        if bankCheckbox and bankCheckbox.SetTooltip then
-            bankCheckbox:SetTooltip(function(tooltip)
-                GameTooltip_SetTitle(tooltip, bankLabel)
-                GameTooltip_AddNormalLine(tooltip, "When checked, the Have Materials filter counts reagents in your character bank and Warband bank.")
-                GameTooltip_AddNormalLine(tooltip, "Uncheck to count only what you carry (bags and reagent bag).")
-                GameTooltip_AddNormalLine(tooltip, "|cFF888888Saved between sessions. Also toggled with /rp bank.|r")
-            end)
         end
 
         if checkbox and checkbox.SetTooltip then
             checkbox:SetTooltip(function(tooltip)
-                GameTooltip_SetTitle(tooltip, "Have Materials (incl. Sub-Crafts)")
-                GameTooltip_AddNormalLine(tooltip, "Only show learned recipes you can craft right now, counting reagents you could craft first from the base materials you have.")
-                GameTooltip_AddNormalLine(tooltip, "All reagents share one pool, so a recipe needing two crafted reagents is hidden if you only have materials for one.")
-                GameTooltip_AddNormalLine(tooltip, "|cFF888888Bank and Warband bank are counted only if the option below is checked. Also toggled with /rp filter.|r")
+                GameTooltip_SetTitle(tooltip, label)
+                for _, line in ipairs(tooltipLines) do
+                    GameTooltip_AddNormalLine(tooltip, line)
+                end
             end)
         end
     end)
+end
+
+-- Diagnostic for /rp why on the Crafting Orders tab: explains the filter / highlight verdict for the open order
+local function PrintOrderDiagnostic(order)
+    local P = function(s) print("  " .. s) end
+    local function ItemName(itemID)
+        return (itemID and C_Item and C_Item.GetItemNameByID and C_Item.GetItemNameByID(itemID)) or ("item " .. tostring(itemID))
+    end
+
+    local recipeID = order.spellID or order.recipeID
+    local rInfo = recipeID and C_TradeSkillUI.GetRecipeInfo(recipeID)
+    print(("|cFF00CCFFReciPeek why (order):|r %s  recipe=%s orderID=%s type=%s reagentState=%s learned=%s"):format(
+        tostring(rInfo and rInfo.name), tostring(recipeID), tostring(order.orderID), tostring(order.orderType),
+        tostring(order.reagentState), tostring(rInfo and rInfo.learned)))
+
+    -- Filter state, and what the last filter pass decided for this order (if it was in the list)
+    local listed = "not seen by the filter"
+    for option, passed in pairs(lastOrdersFilterResults) do
+        if option.orderID and option.orderID == order.orderID then
+            listed = passed and "PASSED" or "FAILED (should have been hidden)"
+        end
+    end
+    P(("filter on=%s  list built with filter=%s  last pass for this order: %s"):format(
+        tostring(ordersFilterEnabled), tostring(ordersListBuiltWithFilter), listed))
+    if lastOrdersFilterError then
+        P("|cFFFF6666last filter error:|r " .. lastOrdersFilterError)
+    end
+    local scrollBox = GetOrdersScrollBox()
+    local listProvider = scrollBox and scrollBox.GetDataProvider and scrollBox:GetDataProvider()
+    if listProvider and listProvider.Enumerate then
+        local inList = false
+        for _, elem in listProvider:Enumerate() do
+            if type(elem) == "table" and type(elem.option) == "table" and elem.option.orderID == order.orderID then
+                inList = true
+            end
+        end
+        P(("order list rows=%s  this order in list=%s"):format(
+            tostring(listProvider.GetSize and listProvider:GetSize()), tostring(inList)))
+    end
+
+    -- Raw customer-provided reagents as the order reports them
+    for _, r in ipairs(order.reagents or {}) do
+        local info = r.reagentInfo or r.reagent or r
+        local nested = info.reagent or r.reagent
+        local itemID = (nested and nested.itemID) or info.itemID or r.itemID
+        P(("customer gives: %s x%s  slotIndex=%s basic=%s source=%s"):format(ItemName(itemID),
+            tostring(info.quantity or r.quantity), tostring(r.slotIndex), tostring(r.isBasicReagent), tostring(r.source)))
+    end
+
+    EnsureProfessionItemMap()
+    local ctx = NewMaterialsFilterContext()
+    local customer = ExtractCustomerProvidedMap(order)
+    local req = recipeID and GetRecipeRequirements(recipeID)
+    if not req then
+        P("|cFFFF6666no requirements could be read for this recipe|r")
+    else
+        P(("requirements: %d slot(s) counted, salvage=%s evaluable=%s"):format(#req.slots, tostring(req.isSalvage), tostring(req.evaluable)))
+        for _, slot in ipairs(req.slots) do
+            local have, given = 0, 0
+            for _, r in ipairs(slot.reagents) do
+                have = have + GetFilterReagentCount(ctx, r)
+                given = given + ((r.itemID and customer[r.itemID]) or 0)
+            end
+            local subRecipeID = FindLearnedSubRecipe(slot.reagents)
+            P(("%s: need %d  you have %d  customer gives %d  sub-craft recipe=%s"):format(
+                ItemName(slot.reagents[1].itemID), slot.quantity, have, given, tostring(subRecipeID)))
+        end
+    end
+
+    -- Slots on the recipe that the check skips (optional / finishing reagents)
+    local schematic = recipeID and C_TradeSkillUI.GetRecipeSchematic(recipeID, false)
+    for _, slot in ipairs((schematic and schematic.reagentSlotSchematics) or {}) do
+        local first = slot.reagents and slot.reagents[1]
+        P(("  schematic slot: %s  type=%s required=%s need=%s variants=%d"):format(
+            first and ItemName(first.itemID) or "?", tostring(slot.reagentType), tostring(slot.required),
+            tostring(slot.quantityRequired), slot.reagents and #slot.reagents or 0))
+    end
+
+    local verdict = EvaluateOrderReadiness(order, ctx)
+    P("Verdict: " .. ((verdict == "direct" and "|cFF00FF66ready now|r") or (verdict == "subcraft" and "|cFF33E0E6ready after sub-crafts|r") or "|cFFFF6666not ready (filter hides it)|r"))
 end
 
 -- Slash Command Handler (/rp or /recipeek)
@@ -2012,9 +2315,44 @@ SlashCmdList["RECIPEEK"] = function(msg)
         SetMaterialsFilterEnabled(not materialsFilterEnabled)
         print("|cFF00CCFFReciPeek:|r Have Materials (incl. Sub-Crafts) filter " .. (materialsFilterEnabled and "|cFF00FF66enabled|r" or "|cFFFF6666disabled|r") .. ".")
         return
-    elseif cmd == "bank" then
-        SetFilterIncludesBank(not filterIncludesBank)
-        print("|cFF00CCFFReciPeek:|r Have Materials filter " .. (filterIncludesBank and "|cFF00FF66now counts|r" or "|cFFFF6666no longer counts|r") .. " bank and Warband bank items.")
+    elseif cmd == "orders" then
+        SetOrdersFilterEnabled(not ordersFilterEnabled)
+        print("|cFF00CCFFReciPeek:|r Crafting Orders Have Materials filter " .. (ordersFilterEnabled and "|cFF00FF66enabled|r" or "|cFFFF6666disabled|r") .. ".")
+        return
+    elseif cmd == "why" then
+        -- Diagnostic: on an open crafting order, explain the Orders filter verdict for it
+        local ordersPage = GetOrdersPage()
+        local orderView = ordersPage and ordersPage.OrderView
+        if orderView and orderView:IsVisible() and type(orderView.order) == "table" then
+            PrintOrderDiagnostic(orderView.order)
+            return
+        end
+
+        -- Diagnostic: explains the Have Materials filter verdict for the recipe currently displayed
+        local recipeID = GetCurrentDisplayedRecipeID()
+        local info = recipeID and C_TradeSkillUI.GetRecipeInfo(recipeID)
+        if not info then
+            print("|cFF00CCFFReciPeek:|r Select a recipe in the Recipes tab first.")
+            return
+        end
+        EnsureProfessionItemMap()
+        print(("|cFF00CCFFReciPeek why:|r %s (id %d) learned=%s numAvailable=%s"):format(
+            tostring(info.name), recipeID, tostring(info.learned), tostring(info.numAvailable)))
+        local schematic = C_TradeSkillUI.GetRecipeSchematic(recipeID, false)
+        for _, slot in ipairs((schematic and schematic.reagentSlotSchematics) or {}) do
+            local have = 0
+            for _, r in ipairs(slot.reagents or {}) do
+                if r.itemID and r.itemID > 0 then
+                    have = have + GetPlayerReagentCount(r.itemID)
+                end
+            end
+            local first = slot.reagents and slot.reagents[1]
+            local name = first and first.itemID and C_Item.GetItemNameByID(first.itemID) or (first and first.currencyID and ("currency " .. first.currencyID)) or "?"
+            print(("  %s  type=%s required=%s need=%s  have=%d"):format(
+                name, tostring(slot.reagentType), tostring(slot.required), tostring(slot.quantityRequired), have))
+        end
+        local ctx = NewMaterialsFilterContext()
+        print("  Filter result: " .. (RecipePassesMaterialsFilter(info, ctx) and "|cFF00FF66shown|r" or "|cFFFF6666hidden|r"))
         return
     end
 
@@ -2027,4 +2365,4 @@ SlashCmdList["RECIPEEK"] = function(msg)
     else
         print("|cFF00CCFFReciPeek:|r Open a Profession window and click any craftable reagent (or type /rp to pin the active recipe).")
     end
-end
+end
