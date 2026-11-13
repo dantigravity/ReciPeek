@@ -1,5 +1,5 @@
 -- ============================================================================
--- ReciPeek (v1.4.0)
+-- ReciPeek (v1.5.0)
 -- Author: Dantigravity
 -- Description: Tabbed reagent recipe inspector, custom quantity crafter, and
 --              availability highlighter for Recipes and Crafting Orders.
@@ -339,7 +339,9 @@ end
 
 -- Reserves materials for `crafts` executions of recipeID from the shared pool, crafting any
 -- missing intermediate reagents recursively. Returns false if materials run out at any depth.
-local function ReserveCraftMaterials(recipeID, crafts, pool, ctx, depth, visiting)
+-- If `steps` is given, every craft involved is appended to it in the order it must happen
+-- (intermediate reagents first, recipeID itself last).
+local function ReserveCraftMaterials(recipeID, crafts, pool, ctx, depth, visiting, steps)
     if depth > MATERIALS_FILTER_MAX_DEPTH or visiting[recipeID] then return false end
 
     local req = GetRecipeRequirements(recipeID)
@@ -375,7 +377,7 @@ local function ReserveCraftMaterials(recipeID, crafts, pool, ctx, depth, visitin
             end
 
             local subCrafts = math.ceil(need / subReq.yield)
-            if not ReserveCraftMaterials(subRecipeID, subCrafts, pool, ctx, depth + 1, visiting) then
+            if not ReserveCraftMaterials(subRecipeID, subCrafts, pool, ctx, depth + 1, visiting, steps) then
                 ok = false
                 break
             end
@@ -390,6 +392,9 @@ local function ReserveCraftMaterials(recipeID, crafts, pool, ctx, depth, visitin
     end
 
     visiting[recipeID] = nil
+    if ok and steps then
+        table.insert(steps, { recipeID = recipeID, count = crafts })
+    end
     return ok
 end
 
@@ -1165,6 +1170,295 @@ local function GetSuggestedCraftQtyForReagent(parentRecipeID, clickedItemID, sub
     return 1
 end
 
+local RefreshPeekWindow
+local UpdateMainSchematicFormIndicators
+
+-- ============================================================================
+-- MASTER CRAFT & BATCH CRAFTING
+-- ----------------------------------------------------------------------------
+-- A craft run is a list of target recipes and how many of each to make. Each
+-- click crafts the next step of its plan: missing intermediate reagents first
+-- (deepest first), then the targets. WoW only starts a craft from a click, so
+-- every step takes one click, but one step can be many crafts of one recipe.
+-- The plan is rebuilt from current bags after every craft.
+-- ============================================================================
+
+local MASTER_CRAFT_MAX_QTY = 999
+
+-- { targets = { { recipeID, remaining, spellIDs = { [id] = true } }, ... }, prepOnly = boolean }
+-- A prep-only run (main window "Prep All") crafts the reagents but leaves the target itself to
+-- Blizzard's Create button, so its reagent quality, finishing reagents and concentration apply.
+local craftRun = nil
+
+local function CopyPool(pool)
+    local copy = {}
+    for k, v in pairs(pool) do copy[k] = v end
+    return copy
+end
+
+local function IsRecipeLearned(recipeID)
+    local info = C_TradeSkillUI and C_TradeSkillUI.GetRecipeInfo and C_TradeSkillUI.GetRecipeInfo(recipeID)
+    if info then return info.learned ~= false end
+    local cached = recipeNameCache[recipeID]
+    return (cached and cached.learned ~= false) or false
+end
+
+local function GetRecipeDisplayName(recipeID)
+    local info = C_TradeSkillUI and C_TradeSkillUI.GetRecipeInfo and C_TradeSkillUI.GetRecipeInfo(recipeID)
+    return (info and info.name) or (recipeNameCache[recipeID] and recipeNameCache[recipeID].name) or ("Recipe #" .. tostring(recipeID))
+end
+
+local function ShortenName(name, maxLen)
+    if string.len(name) > maxLen then
+        return string.sub(name, 1, maxLen - 2) .. ".."
+    end
+    return name
+end
+
+-- Largest count (up to `wanted`) of recipeID that `pool` covers, crafting intermediate reagents as needed
+local function GetMaxPlannableCrafts(recipeID, wanted, pool, ctx)
+    if not recipeID or (wanted or 0) < 1 or not IsRecipeLearned(recipeID) then return 0 end
+    local function Fits(n)
+        return ReserveCraftMaterials(recipeID, n, CopyPool(pool), ctx, 0, {})
+    end
+    if not Fits(1) then return 0 end
+    if Fits(wanted) then return wanted end
+    local lo, hi = 1, wanted  -- Fits(lo) is true, Fits(hi) is false
+    while hi - lo > 1 do
+        local mid = math.floor((lo + hi) / 2)
+        if Fits(mid) then lo = mid else hi = mid end
+    end
+    return lo
+end
+
+-- Plans every craft needed for `targets` ({ recipeID, count } list). All targets draw from one shared
+-- pool, in order, so they never count the same materials twice. Returns the ordered steps
+-- ({ recipeID, count }, one per recipe, intermediates first) and how many of each target are covered.
+local function BuildCraftPlan(targets)
+    EnsureProfessionItemMap()
+    local ctx = NewMaterialsFilterContext()
+    local pool, rawSteps, planned = {}, {}, {}
+    for i, target in ipairs(targets) do
+        local n = GetMaxPlannableCrafts(target.recipeID, target.count, pool, ctx)
+        planned[i] = n
+        if n > 0 then
+            ReserveCraftMaterials(target.recipeID, n, pool, ctx, 0, {}, rawSteps)
+        end
+    end
+
+    -- One step per recipe, placed where it is first needed (its own intermediates are always earlier)
+    local steps, byRecipe = {}, {}
+    for _, s in ipairs(rawSteps) do
+        local existing = byRecipe[s.recipeID]
+        if existing then
+            existing.count = existing.count + s.count
+        else
+            local step = { recipeID = s.recipeID, count = s.count }
+            byRecipe[s.recipeID] = step
+            table.insert(steps, step)
+        end
+    end
+    return steps, planned
+end
+
+-- Targets of the active run that still need crafting, as { recipeID, count } for BuildCraftPlan
+local function GetCraftRunTargets()
+    local list = {}
+    if craftRun then
+        for _, t in ipairs(craftRun.targets) do
+            if t.remaining > 0 then
+                table.insert(list, { recipeID = t.recipeID, count = t.remaining })
+            end
+        end
+    end
+    return list
+end
+
+local function EndCraftRun(message)
+    craftRun = nil
+    if message then
+        print("|cFF00CCFFReciPeek:|r " .. message)
+    end
+end
+
+-- Plans the active run's next step. Returns steps, the next step (nil when out of materials) and its
+-- verb ("Prep" for a reagent, "Craft" for a target). Returns nil if the run just ended: everything is
+-- crafted, or a prep-only run has nothing left but its target.
+local function DescribeCraftRun()
+    if not craftRun then return nil end
+    local targets = GetCraftRunTargets()
+    if #targets == 0 then
+        EndCraftRun("Crafting finished.")
+        return nil
+    end
+    local steps = BuildCraftPlan(targets)
+    local step = steps[1]
+    local isTarget = false
+    if step then
+        for _, t in ipairs(craftRun.targets) do
+            if t.remaining > 0 and t.recipeID == step.recipeID then isTarget = true end
+        end
+    end
+    if step and isTarget and craftRun.prepOnly then
+        EndCraftRun(string.format("Reagents ready. Click Create to craft %s.", GetRecipeDisplayName(step.recipeID)))
+        return nil
+    end
+    return steps, step, isTarget and "Craft" or "Prep"
+end
+
+-- Refreshes everything that shows run state (main window buttons and the side window)
+local function RefreshCraftRunDisplays(delay)
+    C_Timer.After(delay or 0.2, function()
+        if UpdateMainSchematicFormIndicators then UpdateMainSchematicFormIndicators() end
+        if peekFrame and peekFrame:IsShown() then RefreshPeekWindow() end
+    end)
+end
+
+-- Crafts the next step of the active run. Must be called from a click.
+local function ExecuteNextCraftStep()
+    if not craftRun or IsPlayerCrafting() then return end
+    local steps, step = DescribeCraftRun()
+    if not steps then return end
+    if not step then
+        print("|cFF00CCFFReciPeek:|r Out of materials for the rest of this run. Click Cancel to stop it.")
+        return
+    end
+    if C_TradeSkillUI and C_TradeSkillUI.CraftRecipe then
+        C_TradeSkillUI.CraftRecipe(step.recipeID, step.count)
+    end
+end
+
+-- Starts a run for targets ({ recipeID, count } list) and crafts its first step. Must be called from a click.
+local function StartCraftRun(targets, prepOnly)
+    local runTargets = {}
+    for _, t in ipairs(targets) do
+        if t.recipeID and (t.count or 0) > 0 then
+            -- A ranked recipe may be cast as its highest learned rank, so match either spell
+            local spellIDs = { [t.recipeID] = true }
+            local info = C_TradeSkillUI and C_TradeSkillUI.GetRecipeInfo and C_TradeSkillUI.GetRecipeInfo(t.recipeID)
+            if info and info.nextRecipeID and Professions and Professions.GetHighestLearnedRecipe then
+                local highest = Professions.GetHighestLearnedRecipe(info)
+                if highest and highest.recipeID then spellIDs[highest.recipeID] = true end
+            end
+            table.insert(runTargets, { recipeID = t.recipeID, remaining = t.count, spellIDs = spellIDs })
+        end
+    end
+    if #runTargets == 0 then return end
+    craftRun = { targets = runTargets, prepOnly = prepOnly and true or false }
+    ExecuteNextCraftStep()
+end
+
+-- Counts a finished cast toward the run's targets (UNIT_SPELLCAST_SUCCEEDED; a recipe's spell is its recipeID)
+local function OnCraftCastSucceeded(spellID)
+    if not craftRun or not spellID then return end
+    local counted = false
+    local allDone = true
+    for _, t in ipairs(craftRun.targets) do
+        if not counted and t.remaining > 0 and t.spellIDs[spellID] then
+            t.remaining = t.remaining - 1
+            counted = true
+        end
+        if t.remaining > 0 then allDone = false end
+    end
+    if counted and allDone then
+        EndCraftRun("Crafting finished.")
+    end
+end
+
+-- Builds the tooltip lines describing a plan
+local function AddPlanToTooltip(steps, targetIDs)
+    if #steps == 0 then
+        GameTooltip:AddLine("Not enough materials, even counting sub-crafts.", 1, 0.4, 0.4)
+        return
+    end
+    for i, step in ipairs(steps) do
+        local verb = targetIDs[step.recipeID] and "Craft" or "Prep"
+        GameTooltip:AddLine(string.format("%d. %s %dx %s", i, verb, step.count, GetRecipeDisplayName(step.recipeID)), 1, 1, 1)
+    end
+end
+
+-- Updates the side window's [Batch] button. Idle, it crafts every ticked tab at its own quantity;
+-- while any crafting run is active it shows and advances that run's next step (right-click cancels).
+local function UpdateCraftRunControls()
+    local batchBtn = peekFrame.batchBtn
+    local crafting = IsPlayerCrafting()
+
+    local checkedTabs = {}
+    for _, tab in ipairs(openTabs) do
+        if tab.batch then table.insert(checkedTabs, tab) end
+    end
+
+    local steps, step, verb
+    if craftRun then
+        steps, step, verb = DescribeCraftRun()  -- may end the run, which falls through to idle below
+    end
+    local isRun = craftRun ~= nil
+
+    if isRun then
+        if crafting then
+            batchBtn:SetText("Crafting...")
+            batchBtn:Disable()
+        elseif step then
+            local more = (#steps > 1) and string.format(" (+%d)", #steps - 1) or ""
+            batchBtn:SetText(string.format("%s: %dx %s%s", verb, step.count,
+                ShortenName(GetRecipeDisplayName(step.recipeID), 22), more))
+            batchBtn:Enable()
+        else
+            batchBtn:SetText("Out of materials (right-click to cancel)")
+            batchBtn:Enable()
+        end
+    else
+        batchBtn:SetText(string.format("Batch Craft Ticked Tabs (%d)", #checkedTabs))
+        if #checkedTabs > 0 and not crafting then batchBtn:Enable() else batchBtn:Disable() end
+    end
+
+    batchBtn:SetScript("OnClick", function(_, mouseButton)
+        peekFrame.qtyBox:ClearFocus()
+        if isRun then
+            if mouseButton == "RightButton" then
+                EndCraftRun("Crafting run cancelled.")
+            else
+                ExecuteNextCraftStep()
+            end
+        elseif mouseButton == "LeftButton" then
+            local targets = {}
+            for _, tab in ipairs(checkedTabs) do
+                table.insert(targets, { recipeID = tab.recipeID, count = tab.craftQty or 1 })
+            end
+            StartCraftRun(targets)
+        end
+        RefreshCraftRunDisplays()
+    end)
+
+    batchBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        if isRun and craftRun then
+            GameTooltip:AddLine("Crafting Run: Next Step", 1, 0.82, 0)
+            local targetIDs = {}
+            for _, t in ipairs(craftRun.targets) do
+                GameTooltip:AddLine(string.format("%s: %d left", GetRecipeDisplayName(t.recipeID), t.remaining), 0.6, 0.85, 1)
+                if t.remaining > 0 then targetIDs[t.recipeID] = true end
+            end
+            GameTooltip:AddLine(" ")
+            AddPlanToTooltip(steps or {}, targetIDs)
+            GameTooltip:AddLine(" ")
+            GameTooltip:AddLine("Left-click: next step (WoW needs a click to start each craft). Right-click: cancel.", 0.6, 0.6, 0.6, true)
+        else
+            GameTooltip:AddLine("Batch Craft", 1, 0.82, 0)
+            GameTooltip:AddLine("Tick the box on any tabs to craft each of them at its own quantity, prepping missing reagents first.", 0.85, 0.85, 0.85, true)
+            GameTooltip:AddLine("Tabs share your materials in tab order, left to right.", 0.85, 0.85, 0.85, true)
+            if #checkedTabs > 0 then
+                GameTooltip:AddLine(" ")
+                for _, tab in ipairs(checkedTabs) do
+                    GameTooltip:AddLine(string.format("%dx %s", tab.craftQty or 1, tab.name or GetRecipeDisplayName(tab.recipeID)), 1, 1, 1)
+                end
+            end
+        end
+        GameTooltip:Show()
+    end)
+    batchBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+end
+
 -- ============================================================================
 -- SCHEMATIC FORM REAGENT SLOT INDICATORS
 -- ============================================================================
@@ -1218,6 +1512,35 @@ local function EnsureSlotIndicator(slot)
     pill.label = label
     ind.pill = pill
 
+    -- [Prep] button to the right of the reagent, shown when you're short of it and can craft it.
+    -- Sits past the reagent's name and Blizzard's provided-by checkmark, before a second reagent column.
+    local prep = CreateFrame("Button", nil, ind, "BackdropTemplate")
+    prep:SetSize(34, 18)
+    prep:SetPoint("LEFT", btn, "LEFT", 188, 0)
+    prep:SetFrameLevel(ind:GetFrameLevel() + 3)
+    prep:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8x8",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = false,
+        edgeSize = 7,
+        insets = { left = 1, right = 1, top = 1, bottom = 1 }
+    })
+    prep:SetBackdropColor(0.20, 0.13, 0.02, 0.96)
+    prep:SetBackdropBorderColor(1.0, 0.82, 0.0, 1.0)
+    local prepHighlight = prep:CreateTexture(nil, "HIGHLIGHT")
+    prepHighlight:SetPoint("TOPLEFT", 1, -1)
+    prepHighlight:SetPoint("BOTTOMRIGHT", -1, 1)
+    prepHighlight:SetColorTexture(1.0, 0.85, 0.2, 0.25)
+    local prepLabel = prep:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    if fontPath then
+        prepLabel:SetFont(fontPath, 10, "OUTLINE")
+    end
+    prepLabel:SetPoint("CENTER", prep, "CENTER", 0, 0)
+    prep.label = prepLabel
+    prep.reciPeekNoPeek = true  -- clicking it must not also open the reagent in the side window
+    prep:Hide()
+    ind.prepBtn = prep
+
     slot.reciPeekIndicator = ind
     return ind
 end
@@ -1248,9 +1571,69 @@ local function GetPrimaryItemIDFromReagentSlot(slot)
     return nil
 end
 
+-- False while viewing someone else's profession (linked / guild) or an NPC's: ReciPeek can't craft there
+local function IsViewingOwnProfession()
+    if not C_TradeSkillUI then return false end
+    if C_TradeSkillUI.IsTradeSkillLinked and C_TradeSkillUI.IsTradeSkillLinked() then return false end
+    if C_TradeSkillUI.IsTradeSkillGuild and C_TradeSkillUI.IsTradeSkillGuild() then return false end
+    if C_TradeSkillUI.IsNPCCrafting and C_TradeSkillUI.IsNPCCrafting() then return false end
+    return true
+end
+
+-- Quantity in Blizzard's own craft amount box on the Recipes tab
+local function GetMainCraftQuantity()
+    local page = ProfessionsFrame and ProfessionsFrame.CraftingPage
+    local box = page and page.CreateMultipleInputBox
+    local value = box and box.GetValue and box:GetValue()
+    return math.max(1, tonumber(value) or 1)
+end
+
+-- Returns the reagent slot's schematic (quantity required and accepted reagent variants)
+local function GetSlotSchematic(slot)
+    if slot.GetReagentSlotSchematic then
+        local ok, slotSchem = pcall(slot.GetReagentSlotSchematic, slot)
+        if ok and type(slotSchem) == "table" then return slotSchem end
+    end
+    return slot.reagentSlotSchematic
+end
+
+-- How many crafts of subRecipeID would cover this slot's shortfall at `qty` crafts of the form's recipe
+-- (customer-provided reagents count as on hand). Returns crafts possible, crafts needed and shortfall.
+local function GetSlotPrepCrafts(slot, subRecipeID, qty, customer, ctx)
+    local slotSchem = GetSlotSchematic(slot)
+    if not slotSchem or not slotSchem.reagents or (slotSchem.quantityRequired or 0) <= 0 then return 0, 0, 0 end
+    local have = 0
+    for _, r in ipairs(slotSchem.reagents) do
+        if r.itemID then
+            have = have + GetPlayerReagentCount(r.itemID) + (customer[r.itemID] or 0)
+        end
+    end
+    local shortfall = slotSchem.quantityRequired * qty - have
+    if shortfall <= 0 then return 0, 0, 0 end
+    local subReq = GetRecipeRequirements(subRecipeID)
+    local yield = (subReq and subReq.yield) or 1
+    local wanted = math.ceil(shortfall / yield)
+    return GetMaxPlannableCrafts(subRecipeID, wanted, {}, ctx), wanted, shortfall
+end
+
 -- Applies visual indicators to craftable reagent slots in a SchematicForm
 local function ApplyIndicatorsToSchematicForm(form)
     if not form or not form:IsShown() then return end
+
+    -- Recipes tab: Blizzard's quantity box. Crafting order: one craft, with the customer's reagents counted.
+    local qty, customer = 1, {}
+    local craftForm = ProfessionsFrame.CraftingPage and ProfessionsFrame.CraftingPage.SchematicForm
+    if form == craftForm then
+        qty = GetMainCraftQuantity()
+    else
+        local orderView = ProfessionsFrame.OrdersPage and ProfessionsFrame.OrdersPage.OrderView
+        if orderView and type(orderView.order) == "table" then
+            customer = ExtractCustomerProvidedMap(orderView.order)
+        end
+    end
+    local ctx = NewMaterialsFilterContext()
+    local busy = (craftRun ~= nil) or IsPlayerCrafting()
+    local ownProfession = IsViewingOwnProfession()
 
     local slotsToCheck = {}
     if form.reagentSlotPool and form.reagentSlotPool.EnumerateActive then
@@ -1274,6 +1657,60 @@ local function ApplyIndicatorsToSchematicForm(form)
             local subMaxCraftable, isLearned = GetRecipeMaxCraftableCount(subRecipeID)
             local ind = EnsureSlotIndicator(slot)
             decoratedSlots[slot] = true
+
+            -- Short of this reagent and able to make it (sub-crafts included): offer [Prep N]
+            local prepCrafts, prepWanted, shortfall = 0, 0, 0
+            if isLearned and ownProfession then
+                prepCrafts, prepWanted, shortfall = GetSlotPrepCrafts(slot, subRecipeID, qty, customer, ctx)
+            end
+            local prep = ind.prepBtn
+            -- A run this slot started (prepping this reagent) keeps its button live to click through the steps
+            local ownsRun = craftRun ~= nil and not craftRun.prepOnly and #craftRun.targets == 1
+                and craftRun.targets[1].recipeID == subRecipeID and craftRun.targets[1].remaining > 0
+            if prepCrafts > 0 or ownsRun then
+                local subID, crafts, wanted, short, forQty = subRecipeID, prepCrafts, prepWanted, shortfall, qty
+                prep.label:SetText("|cFFFFD100Prep|r")
+                local enabled = ownsRun and not IsPlayerCrafting() or (not ownsRun and not busy)
+                if enabled then prep:Enable(); prep:SetAlpha(1) else prep:Disable(); prep:SetAlpha(0.5) end
+
+                prep:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+                prep:SetScript("OnClick", function(_, mouseButton)
+                    if ownsRun then
+                        if mouseButton == "RightButton" then
+                            EndCraftRun("Crafting run cancelled.")
+                        else
+                            ExecuteNextCraftStep()
+                        end
+                    elseif mouseButton == "LeftButton" then
+                        StartCraftRun({ { recipeID = subID, count = crafts } })
+                    end
+                    RefreshCraftRunDisplays()
+                end)
+                prep:SetScript("OnEnter", function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    if ownsRun then
+                        local steps, step, verb = DescribeCraftRun()
+                        GameTooltip:AddLine("Prepping " .. GetRecipeDisplayName(subID), 1, 0.82, 0)
+                        if step then
+                            GameTooltip:AddLine(string.format("Next: %s %dx %s", verb, step.count, GetRecipeDisplayName(step.recipeID)), 1, 1, 1)
+                        end
+                        GameTooltip:AddLine("Left-click: next step. Right-click: cancel.", 0.6, 0.6, 0.6, true)
+                    else
+                        GameTooltip:AddLine("Prep " .. GetRecipeDisplayName(subID), 1, 0.82, 0)
+                        GameTooltip:AddLine(string.format("You're %d short for %d craft%s. Crafts %dx %s.",
+                            short, forQty, forQty == 1 and "" or "s", crafts, GetRecipeDisplayName(subID)), 0.85, 0.85, 0.85, true)
+                        if crafts < wanted then
+                            GameTooltip:AddLine(string.format("Materials only cover %d of the %d crafts needed.", crafts, wanted), 1, 0.4, 0.4, true)
+                        end
+                        GameTooltip:AddLine("If it needs its own reagents prepped first, keep clicking Prep to work through them.", 0.6, 0.6, 0.6, true)
+                    end
+                    GameTooltip:Show()
+                end)
+                prep:SetScript("OnLeave", function() GameTooltip:Hide() end)
+                prep:Show()
+            else
+                prep:Hide()
+            end
 
             if isLearned and subMaxCraftable > 0 then
                 -- Materials on hand: green border, row highlight, and craftable count
@@ -1305,8 +1742,119 @@ local function ApplyIndicatorsToSchematicForm(form)
     end
 end
 
+-- [Prep] button beside Blizzard's Create All on the Recipes tab. Preps every missing reagent for
+-- the quantity in Blizzard's box, one click per step, then leaves the final craft to Blizzard's Create
+-- (so its reagent quality, finishing reagents and concentration choices apply). While any crafting
+-- run is active it shows and advances that run's next step instead.
+local function UpdateMainPrepButton()
+    local page = ProfessionsFrame and ProfessionsFrame.CraftingPage
+    if not page or not page.CreateAllButton then return end
+
+    local btn = page.reciPeekPrepBtn
+    if not btn then
+        btn = CreateFrame("Button", nil, page, "UIPanelButtonTemplate")
+        btn:SetSize(72, 22)
+        btn:SetPoint("RIGHT", page.CreateAllButton, "LEFT", -8, 0)
+        btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        page.reciPeekPrepBtn = btn
+    end
+
+    local form = page.SchematicForm
+    local recipeID = page:IsShown() and form and form:IsShown() and GetRecipeIDFromForm(form)
+    if not recipeID or not IsViewingOwnProfession() or not IsRecipeLearned(recipeID) then
+        btn:Hide()
+        return
+    end
+    btn:Show()
+
+    -- A prep-only run belongs to the recipe it was started on; switching recipes drops it
+    if craftRun and craftRun.prepOnly and craftRun.targets[1].recipeID ~= recipeID then
+        craftRun = nil
+    end
+
+    local crafting = IsPlayerCrafting()
+    local steps, step, verb
+    if craftRun then
+        steps, step, verb = DescribeCraftRun()  -- may end the run, which falls through to idle below
+    end
+
+    -- The button just says "Prep" (or "Craft" when a side-window batch reaches a target); the tooltip says what
+    local isRun = craftRun ~= nil
+    local startCount = 0
+    local status  -- tooltip line describing the current state
+    if isRun then
+        btn:SetText(verb or "Prep")
+        if crafting then
+            status = "Crafting..."
+            btn:Disable()
+        elseif step then
+            status = string.format("Next: %s %dx %s", verb, step.count, GetRecipeDisplayName(step.recipeID))
+            btn:Enable()
+        else
+            status = "|cFFFF6666Out of materials. Right-click to cancel.|r"
+            btn:Enable()
+        end
+    else
+        btn:SetText("Prep")
+        local planned
+        steps, planned = BuildCraftPlan({ { recipeID = recipeID, count = GetMainCraftQuantity() } })
+        startCount = planned[1] or 0
+        local prepSteps = math.max(0, #steps - 1)
+        if #steps == 0 then
+            status = "|cFFFF6666Not enough materials, even counting reagents you could craft.|r"
+            btn:Disable()
+        elseif prepSteps == 0 then
+            status = "|cFF00FF66Reagents ready. Nothing to prep.|r"
+            btn:Disable()
+        else
+            status = string.format("Preps reagents for %dx (%d step%s).", startCount, prepSteps, prepSteps == 1 and "" or "s")
+            if crafting then btn:Disable() else btn:Enable() end
+        end
+    end
+
+    btn:SetScript("OnClick", function(_, mouseButton)
+        if isRun then
+            if mouseButton == "RightButton" then
+                EndCraftRun("Crafting run cancelled.")
+            else
+                ExecuteNextCraftStep()
+            end
+        elseif mouseButton == "LeftButton" and startCount > 0 then
+            StartCraftRun({ { recipeID = recipeID, count = startCount } }, true)
+        end
+        RefreshCraftRunDisplays()
+    end)
+
+    btn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        local targetIDs = {}
+        if isRun and craftRun then
+            GameTooltip:AddLine("Crafting Run: Next Step", 1, 0.82, 0)
+            for _, t in ipairs(craftRun.targets) do
+                if t.remaining > 0 then targetIDs[t.recipeID] = true end
+            end
+        else
+            GameTooltip:AddLine("Prep Reagents", 1, 0.82, 0)
+            GameTooltip:AddLine("Crafts every reagent you're missing for the amount in the box, from base materials you have. Then click Create as usual.", 0.85, 0.85, 0.85, true)
+            targetIDs[recipeID] = true
+        end
+        GameTooltip:AddLine(status, 1, 1, 1, true)
+        GameTooltip:AddLine(" ")
+        AddPlanToTooltip(steps or {}, targetIDs)
+        GameTooltip:AddLine(" ")
+        GameTooltip:AddLine("Each click runs one step (WoW needs a click to start each craft).", 0.6, 0.6, 0.6, true)
+        if isRun then
+            GameTooltip:AddLine("Right-click to cancel.", 0.6, 0.6, 0.6, true)
+        end
+        GameTooltip:Show()
+    end)
+end
+
 -- Updates reagent slot indicators on the active SchematicForm (Recipes or Crafting Orders)
-local function UpdateMainSchematicFormIndicators()
+UpdateMainSchematicFormIndicators = function()
+    UpdateMainPrepButton()
+
     for slot in pairs(decoratedSlots) do
         if slot.reciPeekIndicator then
             slot.reciPeekIndicator.rowGlow:Hide()
@@ -1331,8 +1879,6 @@ end
 -- ============================================================================
 -- RECIPEEK TABBED SIDE WINDOW
 -- ============================================================================
-
-local RefreshPeekWindow
 
 -- Opens or focuses a recipe tab in the ReciPeek side window
 local function OpenRecipeInPeekTab(recipeID, suggestedQty)
@@ -1372,10 +1918,11 @@ RefreshPeekWindow = function()
     end
 
     if not peekFrame then
-        -- Main side panel frame (width: 336, height: 444)
+        -- Main side panel frame (width: 336, height: 474)
         local f = CreateFrame("Frame", "ReciPeekSideFrame", ProfessionsFrame, "BackdropTemplate")
-        f:SetSize(336, 444)
-        f:SetPoint("TOPLEFT", ProfessionsFrame, "TOPRIGHT", 6, 0)
+        f:SetSize(336, 474)
+        -- Default spot: just right of the Professions window, bottom edges aligned
+        f:SetPoint("BOTTOMLEFT", ProfessionsFrame, "BOTTOMRIGHT", 6, 0)
         f:SetFrameStrata("HIGH")
         f:EnableMouse(true)
         f:SetMovable(true)
@@ -1517,6 +2064,15 @@ RefreshPeekWindow = function()
         craftAllBtn:SetText("Craft All")
         f.craftAllBtn = craftAllBtn
 
+        -- Batch row above the craft row (also shows / advances any active crafting run)
+        local batchBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+        batchBtn:SetHeight(24)
+        batchBtn:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 12, 42)
+        batchBtn:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 42)
+        batchBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        batchBtn:SetText("Batch Craft Ticked Tabs (0)")
+        f.batchBtn = batchBtn
+
         peekFrame = f
     end
 
@@ -1549,8 +2105,13 @@ RefreshPeekWindow = function()
                 edgeSize = 8,
                 insets = { left = 2, right = 2, top = 2, bottom = 2 }
             })
+            -- "Include in Batch" checkbox
+            btn.batchCheck = CreateFrame("CheckButton", nil, btn, "UICheckButtonTemplate")
+            btn.batchCheck:SetSize(18, 18)
+            btn.batchCheck:SetPoint("LEFT", btn, "LEFT", 1, 0)
+
             btn.label = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-            btn.label:SetPoint("LEFT", btn, "LEFT", 6, 0)
+            btn.label:SetPoint("LEFT", btn.batchCheck, "RIGHT", 0, 0)
 
             -- Individual tab close button ("x")
             btn.closeTab = CreateFrame("Button", nil, btn)
@@ -1570,7 +2131,7 @@ RefreshPeekWindow = function()
         end
 
         btn.label:SetText(string.format("|T%d:13:13:0:0|t %s", tab.icon or 134400, shortName))
-        local btnWidth = math.min(152, btn.label:GetStringWidth() + 26)
+        local btnWidth = math.min(170, btn.label:GetStringWidth() + 40)
         btn:SetWidth(btnWidth)
 
         if xOff + btnWidth > maxRowWidth and xOff > 0 then
@@ -1597,6 +2158,19 @@ RefreshPeekWindow = function()
             activeTabIndex = idx
             RefreshPeekWindow()
         end)
+
+        btn.batchCheck:SetChecked(tab.batch and true or false)
+        btn.batchCheck:SetScript("OnClick", function(self)
+            tab.batch = self:GetChecked() and true or false
+            RefreshPeekWindow()
+        end)
+        btn.batchCheck:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            GameTooltip:AddLine("Include in Batch", 1, 0.82, 0)
+            GameTooltip:AddLine("Ticked tabs are crafted together by the Batch button, each at its own quantity.", 0.85, 0.85, 0.85, true)
+            GameTooltip:Show()
+        end)
+        btn.batchCheck:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
         btn.closeTab:SetScript("OnClick", function()
             if peekFrame.qtyBox then peekFrame.qtyBox:ClearFocus() end
@@ -1625,7 +2199,13 @@ RefreshPeekWindow = function()
     local ownedOutput = outItemID and GetPlayerReagentCount(outItemID) or 0
     local learnedStatus = (rInfo and rInfo.learned == false) and "|cFFFF4444(Unlearned)|r  •  " or ""
     local craftableColor = (maxCraftable > 0) and "|cFF00FF66" or "|cFFFF6666"
-    peekFrame.rStatus:SetText(string.format("%sIn Bags: |cFFFFFFFF%d|r  •  Can Craft: %s%d|r", learnedStatus, ownedOutput, craftableColor, maxCraftable))
+    EnsureProfessionItemMap()
+    local masterMax = GetMaxPlannableCrafts(recipeID, MASTER_CRAFT_MAX_QTY, {}, NewMaterialsFilterContext())
+    local subCraftNote = ""
+    if masterMax > maxCraftable then
+        subCraftNote = string.format("  •  |cFF33E0E6w/ Subs: %d|r", masterMax)
+    end
+    peekFrame.rStatus:SetText(string.format("%sIn Bags: |cFFFFFFFF%d|r  •  Can Craft: %s%d|r%s", learnedStatus, ownedOutput, craftableColor, maxCraftable, subCraftNote))
 
     peekFrame.jumpBtn:SetScript("OnClick", function()
         if peekFrame.qtyBox then peekFrame.qtyBox:ClearFocus() end
@@ -1660,6 +2240,15 @@ RefreshPeekWindow = function()
             row.countText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
             row.countText:SetPoint("RIGHT", row, "RIGHT", -8, 0)
             row.countText:SetJustifyH("RIGHT")
+
+            -- [Prep N] button: crafts just this reagent's shortfall
+            row.prepBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+            row.prepBtn:SetSize(58, 18)
+            row.prepBtn:SetPoint("RIGHT", row, "RIGHT", -62, 0)
+            row.prepBtn:SetNormalFontObject("GameFontNormalSmall")
+            row.prepBtn:SetHighlightFontObject("GameFontHighlightSmall")
+            row.prepBtn:SetDisabledFontObject("GameFontDisableSmall")
+            row.prepBtn:Hide()
 
             row.highlight = row:CreateTexture(nil, "HIGHLIGHT")
             row.highlight:SetAllPoints()
@@ -1735,7 +2324,9 @@ RefreshPeekWindow = function()
 
     -- 3. Configure Bottom Crafting Controls ([Craft] [<] [Qty] [>]   [Craft All [X]])
     local canCraftNow = (maxCraftable > 0) and (not rInfo or rInfo.learned ~= false)
-    local maxAllowedQty = (maxCraftable > 0) and maxCraftable or 999
+    -- The quantity can go up to what prepping covers (so the Prep buttons show); Craft / Craft All stay direct-only
+    local qtyLimit = math.max(maxCraftable, masterMax)
+    local maxAllowedQty = (qtyLimit > 0) and qtyLimit or 999
     local currentQty = math.max(1, math.min(activeTab.craftQty or 1, maxAllowedQty))
     activeTab.craftQty = currentQty
 
@@ -1843,6 +2434,52 @@ RefreshPeekWindow = function()
             C_TradeSkillUI.CraftRecipe(recipeID, maxCraftable)
         end
     end)
+
+    -- 4. Batch row
+    UpdateCraftRunControls()
+
+    -- 5. Per-reagent [Prep N] buttons: craft just the shortfall of one reagent for the chosen quantity
+    local prepCtx = NewMaterialsFilterContext()
+    local busy = (craftRun ~= nil) or IsPlayerCrafting()
+    for i, rg in ipairs(reagents) do
+        local row = peekFrame.reagentRows[i]
+        local shortfall = (rg.required * currentQty) - rg.owned
+        local wanted, prepCrafts, yield = 0, 0, 1
+        if rg.subRecipeID and shortfall > 0 then
+            local subReq = GetRecipeRequirements(rg.subRecipeID)
+            yield = (subReq and subReq.yield) or 1
+            wanted = math.ceil(shortfall / yield)
+            prepCrafts = GetMaxPlannableCrafts(rg.subRecipeID, wanted, {}, prepCtx)
+        end
+
+        if prepCrafts > 0 then
+            row.prepBtn:SetText("Prep " .. prepCrafts)
+            if busy then row.prepBtn:Disable() else row.prepBtn:Enable() end
+            row.prepBtn:SetScript("OnClick", function()
+                peekFrame.qtyBox:ClearFocus()
+                StartCraftRun({ { recipeID = rg.subRecipeID, count = prepCrafts } })
+                RefreshCraftRunDisplays()
+            end)
+            row.prepBtn:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_TOP")
+                GameTooltip:AddLine("Prep " .. rg.name, 1, 0.82, 0)
+                GameTooltip:AddLine(string.format("You're %d short for %d craft%s. Crafts %dx %s (makes at least %d).",
+                    shortfall, currentQty, currentQty == 1 and "" or "s", prepCrafts,
+                    GetRecipeDisplayName(rg.subRecipeID), prepCrafts * yield), 0.85, 0.85, 0.85, true)
+                if prepCrafts < wanted then
+                    GameTooltip:AddLine(string.format("Materials only cover %d of the %d crafts needed.", prepCrafts, wanted), 1, 0.4, 0.4, true)
+                end
+                GameTooltip:AddLine("If this reagent needs its own reagents prepped first, the main button walks through those steps.", 0.6, 0.6, 0.6, true)
+                GameTooltip:Show()
+            end)
+            row.prepBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            row.prepBtn:Show()
+            row.nameText:SetPoint("RIGHT", row, "RIGHT", -124, 0)
+        else
+            row.prepBtn:Hide()
+            row.nameText:SetPoint("RIGHT", row, "RIGHT", -68, 0)
+        end
+    end
 end
 
 -- ============================================================================
@@ -1949,6 +2586,26 @@ local function HookFilterDropdownResetState(dropdown, isOurFilterActive)
     end)
 end
 
+-- Starting filters, applied the first time your own profession window opens each session:
+-- ReciPeek's Have Materials filter on (Recipes and Crafting Orders tabs), Learned on, Unlearned off.
+-- Blizzard's reset (X) still clears them back to showing everything.
+local sessionDefaultFiltersApplied = false
+local function ApplySessionDefaultFilters()
+    if sessionDefaultFiltersApplied or not C_TradeSkillUI then return end
+    -- Skip linked / guild / NPC profession views: "learned" and materials there aren't yours
+    if (C_TradeSkillUI.IsTradeSkillLinked and C_TradeSkillUI.IsTradeSkillLinked())
+        or (C_TradeSkillUI.IsTradeSkillGuild and C_TradeSkillUI.IsTradeSkillGuild())
+        or (C_TradeSkillUI.IsNPCCrafting and C_TradeSkillUI.IsNPCCrafting()) then
+        return
+    end
+    sessionDefaultFiltersApplied = true
+
+    if C_TradeSkillUI.SetShowLearned then C_TradeSkillUI.SetShowLearned(true) end
+    if C_TradeSkillUI.SetShowUnlearned then C_TradeSkillUI.SetShowUnlearned(false) end
+    SetMaterialsFilterEnabled(true)
+    SetOrdersFilterEnabled(true)
+end
+
 local function TryHookProfessionsFrame()
     if not ProfessionsFrame then return end
 
@@ -1962,6 +2619,8 @@ local function TryHookProfessionsFrame()
                 UpdateCraftingOrderBrowseListHighlights()
                 if #openTabs > 0 then RefreshPeekWindow() end
             end)
+            -- After Blizzard has finished setting up its own filters for the window
+            C_Timer.After(0.2, ApplySessionDefaultFilters)
         end)
 
         ProfessionsFrame:HookScript("OnHide", function()
@@ -1975,6 +2634,20 @@ local function TryHookProfessionsFrame()
         hooksecurefunc(craftForm, "Init", function()
             C_Timer.After(0.02, UpdateMainSchematicFormIndicators)
         end)
+
+        -- Prep counts follow Blizzard's craft amount box
+        local qtyBox = ProfessionsFrame.CraftingPage.CreateMultipleInputBox
+        if qtyBox and qtyBox.HasScript and qtyBox:HasScript("OnTextChanged") then
+            local pending = false
+            qtyBox:HookScript("OnTextChanged", function()
+                if pending then return end
+                pending = true
+                C_Timer.After(0.15, function()
+                    pending = false
+                    UpdateMainSchematicFormIndicators()
+                end)
+            end)
+        end
     end
 
     -- Recipes tab list: filter the tree right after Blizzard builds it (before it picks a selection)
@@ -2084,8 +2757,9 @@ eventFrame:RegisterEvent("CRAFTINGORDERS_CAN_REQUEST")
 eventFrame:RegisterEvent("CRAFTINGORDERS_ORDER_PLACEMENT_RESPONSE")
 eventFrame:RegisterEvent("GLOBAL_MOUSE_DOWN")
 eventFrame:RegisterEvent("UPDATE_TRADESKILL_CAST_STOPPED")
+eventFrame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
 
-eventFrame:SetScript("OnEvent", function(self, event, arg1)
+eventFrame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
             ReciPeekDB = ReciPeekDB or {}
@@ -2117,13 +2791,23 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
     elseif event == "UPDATE_TRADESKILL_CAST_STOPPED" then
         ScheduleMaterialsFilterRecheck(0.5)
         ScheduleOrdersFilterRecheck(0.5)
+        -- Re-enable the Prep / Batch buttons once the craft (or repeat) ends
+        if ProfessionsFrame and ProfessionsFrame:IsShown() then
+            RefreshCraftRunDisplays(0.3)
+        end
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+        -- arg3 = spellID; a recipe's craft spell is its recipeID
+        if craftRun then
+            OnCraftCastSucceeded(arg3)
+            RefreshCraftRunDisplays(0.1)
+        end
     elseif event == "GLOBAL_MOUSE_DOWN" then
         if arg1 ~= "LeftButton" then return end
         if IsShiftKeyDown() then return end -- Preserve Shift + Left-Click for chat item linking
         if not ProfessionsFrame or not ProfessionsFrame:IsShown() then return end
 
         local focus = GetMouseFoci and GetMouseFoci()[1] or (GetMouseFocus and GetMouseFocus())
-        if not focus or not IsInsideSchematicForm(focus) then return end
+        if not focus or focus.reciPeekNoPeek or not IsInsideSchematicForm(focus) then return end
 
         local itemID = ExtractReagentItemIDFromFrame(focus)
         local targetRecipeID = GetCraftableRecipeForItemID(itemID, false)
