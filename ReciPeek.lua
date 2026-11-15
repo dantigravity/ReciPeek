@@ -1,5 +1,5 @@
 -- ============================================================================
--- ReciPeek (v1.5.1)
+-- ReciPeek (v1.6.0)
 -- Author: Dantigravity
 -- Description: Tabbed reagent recipe inspector, custom quantity crafter, and
 --              availability highlighter for Recipes and Crafting Orders.
@@ -734,9 +734,10 @@ local ORDER_HIGHLIGHT_STYLES = {
     },
 }
 
--- Creates or retrieves the row highlight overlay for a Crafting Order list row
-local function EnsureOrderRowHighlight(row)
-    if row.reciPeekOrderHighlight then return row.reciPeekOrderHighlight end
+-- Creates or retrieves a row highlight overlay (Crafting Order rows; also Recipes list rows, stored under `field`)
+local function EnsureOrderRowHighlight(row, field)
+    field = field or "reciPeekOrderHighlight"
+    if row[field] then return row[field] end
 
     local hl = CreateFrame("Frame", nil, row, "BackdropTemplate")
     hl:SetPoint("TOPLEFT", row, "TOPLEFT", 1, -1)
@@ -762,12 +763,13 @@ local function EnsureOrderRowHighlight(row)
         edgeSize = 1,
     })
 
-    row.reciPeekOrderHighlight = hl
+    row[field] = hl
     return hl
 end
 
-local function ApplyOrderHighlightStyle(hl, state)
-    local style = ORDER_HIGHLIGHT_STYLES[state] or ORDER_HIGHLIGHT_STYLES.direct
+local function ApplyOrderHighlightStyle(hl, state, styles)
+    styles = styles or ORDER_HIGHLIGHT_STYLES
+    local style = styles[state] or ORDER_HIGHLIGHT_STYLES.direct
     if hl.reciPeekState == state then return end
     hl.reciPeekState = state
     hl.bg:SetColorTexture(unpack(style.bg))
@@ -2483,6 +2485,436 @@ RefreshPeekWindow = function()
 end
 
 -- ============================================================================
+-- RECIPE LIST QUICKVIEW: MISSING MATERIALS TOOLTIP & SUB-RECIPE HIGHLIGHTS
+-- ----------------------------------------------------------------------------
+-- Hovering a recipe in the Recipes tab list shows what you're missing to craft
+-- it: reagents you're short of outright and, for reagents you can craft, whether
+-- your base materials cover them (and which of those are short if not). Every
+-- count draws from one shared pool, like the Have Materials filter, so nothing
+-- is counted twice. While hovering, recipes in the list that craft the hovered
+-- recipe's reagents (at any depth) are tinted: green = you have the reagent or
+-- the materials to make it, yellow = you're missing it or what it takes.
+-- ============================================================================
+
+local QUICKVIEW_MAX_LINES = 18
+
+local RECIPE_ROW_HIGHLIGHT_STYLES = {
+    ready = ORDER_HIGHLIGHT_STYLES.direct,
+    missing = {
+        bg     = { 0.62, 0.50, 0.02, 0.22 },
+        bar    = { 1.00, 0.86, 0.10, 0.95 },
+        border = { 1.00, 0.82, 0.15, 0.55 },
+    },
+}
+
+local recipeRowHighlights = {}   -- recipeID -> "ready" | "missing" while a recipe row is hovered
+local decoratedRecipeRows = {}
+
+local function IsQuickviewEnabled()
+    return not (ReciPeekDB and ReciPeekDB.recipeQuickview == false)
+end
+
+local function GetReagentDisplayName(reagent)
+    if reagent.itemID then
+        local name = C_Item and C_Item.GetItemNameByID and C_Item.GetItemNameByID(reagent.itemID)
+        if not name and C_Item and C_Item.RequestLoadItemDataByID then
+            C_Item.RequestLoadItemDataByID(reagent.itemID)
+        end
+        return name or ("Item #" .. reagent.itemID)
+    elseif reagent.currencyID then
+        local info = C_CurrencyInfo and C_CurrencyInfo.GetCurrencyInfo and C_CurrencyInfo.GetCurrencyInfo(reagent.currencyID)
+        return (info and info.name) or ("Currency #" .. reagent.currencyID)
+    end
+    return "?"
+end
+
+-- Any recipe in this profession, learned or not, that crafts one of the slot's reagent variants
+local function FindAnySubRecipe(reagents)
+    for _, r in ipairs(reagents) do
+        local subRecipeID = r.itemID and itemToRecipeMap[r.itemID]
+        if subRecipeID then return subRecipeID end
+    end
+    return nil
+end
+
+-- Walks `crafts` executions of recipeID against the shared pool like ReserveCraftMaterials, but keeps
+-- going past a shortfall so every one gets listed. Appends one line per short reagent to `lines`
+-- (a craftable reagent's own shortfalls follow it, one level deeper) and the state of every reagent
+-- that has a recipe in this profession to `rowStates`. Returns true if everything is covered.
+local function CollectMissingMaterials(recipeID, crafts, pool, ctx, depth, visiting, lines, rowStates)
+    if depth > MATERIALS_FILTER_MAX_DEPTH or visiting[recipeID] then return false end
+    local req = GetRecipeRequirements(recipeID)
+    if not req or req.isSalvage or not req.evaluable then return false end
+
+    visiting[recipeID] = true
+    local allCovered = true
+
+    for _, slot in ipairs(req.slots) do
+        -- 1. Use what is already on hand (any quality tier / accepted variant)
+        local need = slot.quantity * crafts
+        for _, r in ipairs(slot.reagents) do
+            if need <= 0 then break end
+            local have = pool[r.key]
+            if have == nil then have = GetFilterReagentCount(ctx, r) end
+            local use = math.min(have, need)
+            pool[r.key] = have - use
+            need = need - use
+        end
+
+        local covered = need <= 0
+        local subRecipeID = FindLearnedSubRecipe(slot.reagents)
+        local anySubRecipeID = subRecipeID or FindAnySubRecipe(slot.reagents)
+
+        -- 2. Short: see whether it can be crafted from what's left in the pool
+        if not covered then
+            local line = { depth = depth, key = slot.reagents[1].key, name = GetReagentDisplayName(slot.reagents[1]), missing = need }
+
+            local subReq = subRecipeID and GetRecipeRequirements(subRecipeID)
+            if subReq and not subReq.isSalvage and subReq.evaluable and not visiting[subRecipeID] then
+                local subCrafts = math.ceil(need / subReq.yield)
+                line.subCrafts = subCrafts
+                line.canMake = GetMaxPlannableCrafts(subRecipeID, subCrafts, CopyPool(pool), ctx)
+                covered = CollectMissingMaterials(subRecipeID, subCrafts, pool, ctx, depth + 1, visiting, lines, rowStates)
+                line.status = covered and "craft" or "short"
+                -- Added after its own reagents, so crafts are listed in the order they'd happen
+                table.insert(lines, line)
+
+                -- Leftover output (e.g. recipe yields 2, only 1 needed) stays available for other slots
+                local surplus = (subCrafts * subReq.yield) - need
+                if surplus > 0 then
+                    local key = slot.reagents[1].key
+                    pool[key] = (pool[key] or 0) + surplus
+                end
+            else
+                line.status = (anySubRecipeID and not subRecipeID) and "unlearned" or "none"
+                table.insert(lines, line)
+            end
+        end
+
+        if anySubRecipeID then
+            -- A recipe needed in several places is yellow if any of them is short
+            if rowStates[anySubRecipeID] ~= "missing" then
+                rowStates[anySubRecipeID] = covered and "ready" or "missing"
+            end
+        end
+        if not covered then allCovered = false end
+    end
+
+    visiting[recipeID] = nil
+    return allCovered
+end
+
+local function IsRowTintEnabled()
+    return not (ReciPeekDB and ReciPeekDB.recipeRowTints == false)
+end
+
+-- Splits the walker's lines into reagents to craft and reagents to get, merging repeats of the same
+-- reagent (e.g. ore needed for two different bars) into one line
+local function GroupQuickviewLines(lines)
+    local craftList, missingList, byKey = {}, {}, {}
+    for _, line in ipairs(lines) do
+        local isCraft = line.status == "craft" or line.status == "short"
+        local groupKey = (isCraft and "c:" or "m:") .. tostring(line.key)
+        local entry = byKey[groupKey]
+        if entry then
+            entry.missing = entry.missing + line.missing
+            entry.subCrafts = (entry.subCrafts or 0) + (line.subCrafts or 0)
+            entry.canMake = (entry.canMake or 0) + (line.canMake or 0)
+            if line.status == "short" then entry.status = "short" end
+        else
+            entry = { name = line.name, missing = line.missing, status = line.status,
+                      subCrafts = line.subCrafts, canMake = line.canMake }
+            byKey[groupKey] = entry
+            table.insert(isCraft and craftList or missingList, entry)
+        end
+    end
+    return craftList, missingList
+end
+
+local QUICKVIEW_GOLD = { 1.00, 0.82, 0.00 }
+local QUICKVIEW_GREEN = { 0.10, 1.00, 0.40 }
+local QUICKVIEW_YELLOW = { 1.00, 0.86, 0.10 }
+local QUICKVIEW_RED = { 1.00, 0.40, 0.40 }
+local QUICKVIEW_GRAY = { 0.60, 0.60, 0.60 }
+
+local function AddQuickviewRow(tooltip, left, leftColor, right, rightColor)
+    local l, r = leftColor, rightColor or leftColor
+    tooltip:AddDoubleLine(left, right or "", l[1], l[2], l[3], r[1], r[2], r[3])
+end
+
+-- Tooltip layout:
+--   Craft first:                 reagents you can craft (green: can make them all, yellow: "can make X/Y")
+--   Missing:                     what you need to get (red), totalled across every sub-craft
+local function AddQuickviewToTooltip(tooltip, lines, crafts)
+    local craftList, missingList = GroupQuickviewLines(lines)
+    local forText = crafts > 1 and string.format(" (x%d)", crafts) or ""
+
+    if #craftList == 0 and #missingList == 0 then
+        tooltip:AddLine("All materials on hand" .. forText, unpack(QUICKVIEW_GREEN))
+        return
+    end
+
+    local function AddSection(title, list, addEntry)
+        if #list == 0 then return end
+        tooltip:AddLine(title .. forText .. ":", unpack(QUICKVIEW_GOLD))
+        forText = ""  -- only on the first heading
+        for i, entry in ipairs(list) do
+            if i > QUICKVIEW_MAX_LINES then
+                tooltip:AddLine(string.format("  +%d more", #list - QUICKVIEW_MAX_LINES), unpack(QUICKVIEW_GRAY))
+                break
+            end
+            addEntry(string.format("  %dx %s", entry.missing, entry.name), entry)
+        end
+    end
+
+    AddSection("Craft first", craftList, function(left, entry)
+        if entry.status == "craft" then
+            AddQuickviewRow(tooltip, left, QUICKVIEW_GREEN)
+        else
+            -- Yellow: you know the recipe but can't make all of them; what's short is under Missing
+            AddQuickviewRow(tooltip, left, QUICKVIEW_YELLOW, string.format("can make %d/%d", entry.canMake or 0, entry.subCrafts or 0))
+        end
+    end)
+
+    AddSection("Missing", missingList, function(left, entry)
+        AddQuickviewRow(tooltip, left, QUICKVIEW_RED, entry.status == "unlearned" and "not learned" or nil, QUICKVIEW_GRAY)
+    end)
+end
+
+-- Returns the recipeInfo behind a Recipes list row (nil for category headers, dividers and spacers)
+local function GetRecipeRowInfo(row)
+    if not row or not row.GetElementData then return nil end
+    local ok, node = pcall(row.GetElementData, row)
+    if not ok or type(node) ~= "table" then return nil end
+    local data = node.GetData and node:GetData() or node
+    return type(data) == "table" and data.recipeInfo or nil
+end
+
+-- Ranked recipes are listed by rank 1 but crafted with the highest learned rank
+local function GetCraftableRankInfo(info)
+    if info.nextRecipeID and Professions and Professions.GetHighestLearnedRecipe then
+        return Professions.GetHighestLearnedRecipe(info) or info
+    end
+    return info
+end
+
+local function GetRecipeRowHighlightState(info)
+    local state = recipeRowHighlights[info.recipeID]
+    if not state and info.nextRecipeID then
+        state = recipeRowHighlights[GetCraftableRankInfo(info).recipeID]
+    end
+    return state
+end
+
+-- Tints one Recipes list row if it crafts a reagent of the hovered recipe. Returns true if tinted.
+local function UpdateRecipeRowHighlight(row)
+    local info = next(recipeRowHighlights) and row:IsShown() and GetRecipeRowInfo(row)
+    local state = info and GetRecipeRowHighlightState(info)
+    if state then
+        local hl = EnsureOrderRowHighlight(row, "reciPeekRecipeHighlight")
+        ApplyOrderHighlightStyle(hl, state, RECIPE_ROW_HIGHLIGHT_STYLES)
+        decoratedRecipeRows[row] = true
+        hl:Show()
+        return true
+    elseif row.reciPeekRecipeHighlight then
+        row.reciPeekRecipeHighlight:Hide()
+    end
+    return false
+end
+
+-- Re-tints every visible Recipes list row from recipeRowHighlights. Returns how many rows are tinted.
+local function UpdateRecipeListHighlights()
+    for row in pairs(decoratedRecipeRows) do
+        if row.reciPeekRecipeHighlight then row.reciPeekRecipeHighlight:Hide() end
+    end
+    wipe(decoratedRecipeRows)
+    if not next(recipeRowHighlights) then return 0 end
+
+    local page = GetCraftingPage()
+    local scrollBox = page and page.RecipeList and page.RecipeList.ScrollBox
+    if not scrollBox or not scrollBox:IsVisible() or not scrollBox.GetFrames then return 0 end
+    local tinted = 0
+    for _, row in ipairs(scrollBox:GetFrames() or {}) do
+        if UpdateRecipeRowHighlight(row) then tinted = tinted + 1 end
+    end
+    return tinted
+end
+
+-- Tints the list rows of the hovered recipe's reagent recipes (never the hovered recipe itself)
+local function ApplyQuickviewTints(rowStates, recipeID, listRecipeID)
+    rowStates[recipeID] = nil
+    if listRecipeID then rowStates[listRecipeID] = nil end
+    wipe(recipeRowHighlights)
+    for id, state in pairs(rowStates) do recipeRowHighlights[id] = state end
+    UpdateRecipeListHighlights()
+end
+
+-- Why the quickview would or wouldn't show for a row's recipe (nil = it shows). Used by /rp hover too.
+local function GetQuickviewSkipReason(info)
+    if not IsQuickviewEnabled() and not IsRowTintEnabled() then return "tooltip and tints are both off (gear menu)" end
+    if not IsViewingOwnProfession() then return "not your own profession window" end
+    if not info then return "not a recipe row" end
+    if not info.learned then return "recipe not learned" end
+    if info.isDummyRecipe or info.isGatheringRecipe then return "not a craftable recipe" end
+    local craftInfo = GetCraftableRankInfo(info)
+    local req = craftInfo.recipeID and GetRecipeRequirements(craftInfo.recipeID)
+    if not req then return "no reagent data for this recipe" end
+    if req.isSalvage then return "salvage recipe" end
+    if not req.evaluable then return "no required reagents" end
+    return nil
+end
+
+-- Shows the quickview tooltip for a Recipes list row. Returns true if it was shown.
+local function ShowRecipeQuickview(row, info)
+    if GetQuickviewSkipReason(info) then return false end
+    local craftInfo = GetCraftableRankInfo(info)
+    local recipeID = craftInfo.recipeID
+
+    -- The recipe open on the right counts the amount in Blizzard's craft box
+    local crafts = 1
+    local page = GetCraftingPage()
+    local selected = page and page.SchematicForm and page.SchematicForm:IsShown() and GetRecipeIDFromForm(page.SchematicForm)
+    if selected and (selected == recipeID or selected == info.recipeID) then
+        crafts = GetMainCraftQuantity()
+    end
+
+    EnsureProfessionItemMap()
+    local lines, rowStates = {}, {}
+    CollectMissingMaterials(recipeID, crafts, {}, NewMaterialsFilterContext(), 0, {}, lines, rowStates)
+
+    if IsRowTintEnabled() then
+        ApplyQuickviewTints(rowStates, recipeID, info.recipeID)
+    end
+    if not IsQuickviewEnabled() then return false end
+
+    -- Add to Blizzard's tooltip if it put one up for this row (e.g. a truncated name), else show our own
+    local tooltip = GameTooltip
+    local owner = tooltip:IsShown() and tooltip:GetOwner()
+    local ownedByRow = owner and (owner == row or (owner.GetParent and owner:GetParent() == row))
+    if not ownedByRow then
+        tooltip:SetOwner(row, "ANCHOR_RIGHT")
+        tooltip:SetText(craftInfo.name or info.name or GetRecipeDisplayName(recipeID), 1, 1, 1)
+    end
+    local ok, err = pcall(AddQuickviewToTooltip, tooltip, lines, crafts)
+    tooltip:Show()
+    if not ok then geterrorhandler()(err) end
+    return true
+end
+
+-- Hover tracking. Blizzard sets up list rows its own way (and reuses them as the list scrolls), so
+-- rather than hooking each row's scripts, a small watcher on the list checks which row is under the
+-- mouse. It only runs while the Recipes list is visible.
+local quickviewWatcher = nil
+local quickviewRow, quickviewRecipeID = nil, nil  -- row (and its recipe) the quickview is tracking
+local quickviewShown = false
+
+local function IsFrameInside(frame, ancestor)
+    local cur, depth = frame, 0
+    while cur and depth < 12 do
+        if cur == ancestor then return true end
+        cur = cur.GetParent and cur:GetParent() or nil
+        depth = depth + 1
+    end
+    return false
+end
+
+-- Returns the Recipes list row under the mouse and its recipeInfo
+local function GetHoveredRecipeRow(scrollBox)
+    local focus = (GetMouseFoci and GetMouseFoci()[1]) or (GetMouseFocus and GetMouseFocus())
+    -- Some Blizzard frames are forbidden to addons; touching them (even GetParent) is an error
+    if not focus or (focus.IsForbidden and focus:IsForbidden()) then return nil end
+    if not scrollBox or not IsFrameInside(focus, scrollBox) then return nil end
+    local cur, depth = focus, 0
+    while cur and cur ~= scrollBox and depth < 6 do
+        local info = GetRecipeRowInfo(cur)
+        if info then return cur, info end
+        cur = cur.GetParent and cur:GetParent() or nil
+        depth = depth + 1
+    end
+    return nil
+end
+
+local function ClearRecipeQuickview()
+    if next(recipeRowHighlights) then
+        wipe(recipeRowHighlights)
+        UpdateRecipeListHighlights()
+    end
+    if quickviewShown and quickviewRow then
+        local owner = GameTooltip:GetOwner()
+        if owner and (owner == quickviewRow or (owner.GetParent and owner:GetParent() == quickviewRow)) then
+            GameTooltip:Hide()
+        end
+    end
+    quickviewRow, quickviewRecipeID, quickviewShown = nil, nil, false
+end
+
+local function QuickviewWatcherTick(self)
+    local row, info = GetHoveredRecipeRow(self.scrollBox)
+    local recipeID = info and info.recipeID
+    if row == quickviewRow and recipeID == quickviewRecipeID then return end
+
+    -- Moved to another row, off the list, or the row under the mouse now shows another recipe (scrolled)
+    ClearRecipeQuickview()
+    if row then
+        quickviewRow, quickviewRecipeID = row, recipeID
+        quickviewShown = ShowRecipeQuickview(row, info)
+    end
+end
+
+-- Runs often, so an error here would repeat many times a second: report the first one, then
+-- switch the watcher off for the rest of the session instead of flooding the error counter
+local function QuickviewWatcherOnUpdate(self, elapsed)
+    self.elapsed = (self.elapsed or 0) + elapsed
+    if self.elapsed < 0.05 then return end
+    self.elapsed = 0
+
+    local ok, err = pcall(QuickviewWatcherTick, self)
+    if not ok then
+        self:SetScript("OnUpdate", nil)
+        print("|cFF00CCFFReciPeek:|r Recipe list tooltips hit an error and were switched off until /reload. Details: " .. tostring(err))
+    end
+end
+
+local function EnsureQuickviewWatcher(scrollBox)
+    if quickviewWatcher or not scrollBox then return end
+    quickviewWatcher = CreateFrame("Frame", nil, scrollBox)
+    quickviewWatcher.scrollBox = scrollBox
+    quickviewWatcher:SetScript("OnUpdate", QuickviewWatcherOnUpdate)
+    quickviewWatcher:SetScript("OnHide", ClearRecipeQuickview)
+end
+
+-- Called for each Recipes list row as it's set up (also when scrolled into view or reused)
+local function OnRecipeRowInitialized(row)
+    UpdateRecipeRowHighlight(row)  -- keep tints on the right rows while the list scrolls
+end
+
+-- /rp hover: explains what the quickview sees under the mouse (hover a recipe row, then type it)
+local function PrintHoverDiagnostic()
+    local page = GetCraftingPage()
+    local scrollBox = page and page.RecipeList and page.RecipeList.ScrollBox
+    print(("|cFF00CCFFReciPeek hover:|r watcher=%s listVisible=%s tips=%s ownProfession=%s"):format(
+        tostring(quickviewWatcher ~= nil), tostring(scrollBox and scrollBox:IsVisible() or false),
+        tostring(IsQuickviewEnabled()), tostring(IsViewingOwnProfession())))
+    local focus = (GetMouseFoci and GetMouseFoci()[1]) or (GetMouseFocus and GetMouseFocus())
+    local chain, cur, depth = {}, focus, 0
+    while cur and depth < 6 do
+        local name = (cur.GetDebugName and cur:GetDebugName()) or (cur.GetName and cur:GetName()) or "?"
+        table.insert(chain, tostring(name) .. (cur.GetElementData and "[data]" or ""))
+        cur = cur.GetParent and cur:GetParent() or nil
+        depth = depth + 1
+    end
+    print("  under mouse: " .. (#chain > 0 and table.concat(chain, " < ") or "nothing"))
+    local row, info = GetHoveredRecipeRow(scrollBox)
+    if not row then
+        print("  no recipe row found under the mouse")
+        return
+    end
+    local reason = GetQuickviewSkipReason(info)
+    print(("  row recipe: %s (id %s)  tooltip: %s"):format(tostring(info.name), tostring(info.recipeID),
+        reason and ("|cFFFF6666skipped, " .. reason .. "|r") or "|cFF00FF66shows|r"))
+end
+
+-- ============================================================================
 -- FRAME INSPECTION, HOOKS & EVENTS
 -- ============================================================================
 
@@ -2571,6 +3003,7 @@ local isCraftFormHooked = false
 local isOrderFormHooked = false
 local isOrderListHooked = false
 local isRecipeListHooked = false
+local isRecipeRowsHooked = false
 local isFilterDropdownHooked = false
 local isDefaultFiltersHooked = false
 local isOrdersShowHooked = false
@@ -2728,8 +3161,92 @@ local function OnProfessionWindowOpened(triesLeft)
     ApplyFilterSet(type(saved) == "table" and saved or nil)
 end
 
+-- ============================================================================
+-- SETTINGS MENU (gear button on the profession window's title bar, or /rp settings)
+-- ============================================================================
+
+local function SetDBFlag(key, on)
+    ReciPeekDB = ReciPeekDB or {}
+    ReciPeekDB[key] = on and true or false
+end
+
+local function OpenSettingsMenu(anchor)
+    if not MenuUtil or not MenuUtil.CreateContextMenu then
+        print("|cFF00CCFFReciPeek:|r The settings menu isn't available. Use /rp tips, /rp filter or /rp orders.")
+        return
+    end
+    MenuUtil.CreateContextMenu(anchor or UIParent, function(_, root)
+        local function Check(label, isOn, setOn, tipLines)
+            local box = root:CreateCheckbox(label, isOn, function() setOn(not isOn()) end)
+            if box and box.SetTooltip and tipLines then
+                box:SetTooltip(function(tooltip)
+                    GameTooltip_SetTitle(tooltip, label)
+                    for _, line in ipairs(tipLines) do GameTooltip_AddNormalLine(tooltip, line) end
+                end)
+            end
+        end
+
+        root:CreateTitle("ReciPeek: Recipe List")
+        Check("Missing-materials tooltip", IsQuickviewEnabled,
+            function(on) SetDBFlag("recipeQuickview", on) end,
+            { "Hover a recipe to see what to craft first and what you're missing, counting reagents you can craft from materials you have." })
+        Check("Tint reagent recipes on hover", IsRowTintEnabled,
+            function(on) SetDBFlag("recipeRowTints", on); if not on then ClearRecipeQuickview() end end,
+            { "While you hover a recipe, recipes in the list that make its reagents are tinted.",
+              "|cFF00FF66Green|r: you have the reagent or the materials to make it. |cFFFFD100Yellow|r: you're missing it." })
+
+        root:CreateDivider()
+        root:CreateTitle("Filters")
+        Check("Have Materials: Recipes", function() return materialsFilterEnabled end, SetMaterialsFilterEnabled,
+            { "Only show recipes you can craft now, counting reagents you could craft first. Also /rp filter." })
+        Check("Have Materials: Crafting Orders", function() return ordersFilterEnabled end, SetOrdersFilterEnabled,
+            { "Only show orders you can fill with the customer's reagents plus yours. Also /rp orders." })
+        Check("Remember Filters", IsRememberFiltersOn, SetRememberFilters,
+            { "Open your professions with the filters you had when you last closed the window." })
+    end)
+end
+
+-- Small gear on the profession window's title bar, left of Blizzard's minimize / close buttons
+local function EnsureSettingsButton()
+    if not ProfessionsFrame or ProfessionsFrame.reciPeekSettingsBtn then return end
+    local btn = CreateFrame("Button", nil, ProfessionsFrame)
+    btn:SetSize(18, 18)
+    local anchor = ProfessionsFrame.MaximizeMinimize or ProfessionsFrame.CloseButton
+    if anchor then
+        btn:SetPoint("RIGHT", anchor, "LEFT", -2, 0)
+        btn:SetFrameLevel(anchor:GetFrameLevel() + 1)
+    else
+        btn:SetPoint("TOPRIGHT", ProfessionsFrame, "TOPRIGHT", -52, -3)
+    end
+
+    local GEAR_ATLAS = "QuestLog-icon-setting"
+    local hasAtlas = C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(GEAR_ATLAS)
+    local function SetGear(tex)
+        if hasAtlas then tex:SetAtlas(GEAR_ATLAS) else tex:SetTexture("Interface\\WorldMap\\Gear_64Grey") end
+        tex:SetAllPoints()
+    end
+    local icon = btn:CreateTexture(nil, "ARTWORK")
+    SetGear(icon)
+    local glow = btn:CreateTexture(nil, "HIGHLIGHT")
+    SetGear(glow)
+    glow:SetBlendMode("ADD")
+
+    btn:SetScript("OnMouseDown", function() icon:SetPoint("TOPLEFT", 1, -1) end)
+    btn:SetScript("OnMouseUp", function() icon:SetAllPoints() end)
+    btn:SetScript("OnClick", function(self) OpenSettingsMenu(self) end)
+    btn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("ReciPeek Settings", 1, 0.82, 0)
+        GameTooltip:Show()
+    end)
+    btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    ProfessionsFrame.reciPeekSettingsBtn = btn
+end
+
 local function TryHookProfessionsFrame()
     if not ProfessionsFrame then return end
+
+    EnsureSettingsButton()
 
     if not isProfessionsHooked then
         isProfessionsHooked = true
@@ -2791,6 +3308,15 @@ local function TryHookProfessionsFrame()
                 end
             end)
         end)
+    end
+
+    -- Recipes tab list rows: missing-materials tooltip and reagent recipe tints on hover
+    if recipeList and recipeList.ScrollBox then
+        EnsureQuickviewWatcher(recipeList.ScrollBox)
+        if ScrollUtil and ScrollUtil.AddInitializedFrameCallback and not isRecipeRowsHooked then
+            isRecipeRowsHooked = true
+            ScrollUtil.AddInitializedFrameCallback(recipeList.ScrollBox, OnRecipeRowInitialized, nil, true)
+        end
     end
 
     -- Show the filter dropdown's reset (X) button while our filter is active
@@ -3143,6 +3669,18 @@ SlashCmdList["RECIPEEK"] = function(msg)
     elseif cmd == "orders" then
         SetOrdersFilterEnabled(not ordersFilterEnabled)
         print("|cFF00CCFFReciPeek:|r Crafting Orders Have Materials filter " .. (ordersFilterEnabled and "|cFF00FF66enabled|r" or "|cFFFF6666disabled|r") .. ".")
+        return
+    elseif cmd == "tips" then
+        ReciPeekDB = ReciPeekDB or {}
+        ReciPeekDB.recipeQuickview = not IsQuickviewEnabled()
+        print("|cFF00CCFFReciPeek:|r Recipe list missing-materials tooltips " .. (IsQuickviewEnabled() and "|cFF00FF66enabled|r" or "|cFFFF6666disabled|r") .. ".")
+        return
+    elseif cmd == "settings" or cmd == "config" or cmd == "options" then
+        local gear = ProfessionsFrame and ProfessionsFrame:IsShown() and ProfessionsFrame.reciPeekSettingsBtn
+        OpenSettingsMenu(gear or nil)
+        return
+    elseif cmd == "hover" then
+        PrintHoverDiagnostic()
         return
     elseif cmd == "why" then
         -- Diagnostic: on an open crafting order, explain the Orders filter verdict for it
