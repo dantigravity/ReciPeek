@@ -1,5 +1,5 @@
 -- ============================================================================
--- ReciPeek (v1.5.0)
+-- ReciPeek (v1.5.1)
 -- Author: Dantigravity
 -- Description: Tabbed reagent recipe inspector, custom quantity crafter, and
 --              availability highlighter for Recipes and Crafting Orders.
@@ -2586,24 +2586,146 @@ local function HookFilterDropdownResetState(dropdown, isOurFilterActive)
     end)
 end
 
--- Starting filters, applied the first time your own profession window opens each session:
--- ReciPeek's Have Materials filter on (Recipes and Crafting Orders tabs), Learned on, Unlearned off.
--- Blizzard's reset (X) still clears them back to showing everything.
-local sessionDefaultFiltersApplied = false
-local function ApplySessionDefaultFilters()
-    if sessionDefaultFiltersApplied or not C_TradeSkillUI then return end
-    -- Skip linked / guild / NPC profession views: "learned" and materials there aren't yours
-    if (C_TradeSkillUI.IsTradeSkillLinked and C_TradeSkillUI.IsTradeSkillLinked())
+-- Session filters. Blizzard resets its profession filters every session, so:
+--   Remember Filters on  (default): the filters you had when you last closed your profession
+--                                   window come back the first time you open one each session.
+--   Remember Filters off / nothing saved yet: ReciPeek's defaults below.
+-- Saved per account in ReciPeekDB.savedFilters. Blizzard's reset (X) still shows everything.
+local DEFAULT_FILTERS = {
+    recipesHaveMats = true,  -- ReciPeek Have Materials, Recipes tab
+    ordersHaveMats = true,   -- ReciPeek Have Materials, Crafting Orders tab
+    learned = true,
+    unlearned = false,
+    makeable = false,
+    skillUp = false,
+    firstCraft = false,
+}
+
+-- Blizzard's Recipes tab filters that get remembered. field = key in Blizzard's own filter snapshot.
+local BLIZZARD_FILTERS = {
+    { key = "learned",    getter = "GetShowLearned",               setter = "SetShowLearned",               field = "showLearned" },
+    { key = "unlearned",  getter = "GetShowUnlearned",             setter = "SetShowUnlearned",             field = "showUnlearned" },
+    { key = "makeable",   getter = "GetOnlyShowMakeableRecipes",   setter = "SetOnlyShowMakeableRecipes",   field = "showOnlyMakeable" },
+    { key = "skillUp",    getter = "GetOnlyShowSkillUpRecipes",    setter = "SetOnlyShowSkillUpRecipes",    field = "showOnlySkillUps" },
+    { key = "firstCraft", getter = "GetOnlyShowFirstCraftRecipes", setter = "SetOnlyShowFirstCraftRecipes", field = "showOnlyFirstCraft" },
+}
+
+local function IsRememberFiltersOn()
+    return not (ReciPeekDB and ReciPeekDB.rememberFilters == false)
+end
+
+local function SetRememberFilters(on)
+    ReciPeekDB = ReciPeekDB or {}
+    ReciPeekDB.rememberFilters = on and true or false
+end
+
+-- True once the open profession's recipe data has finished loading. Blizzard's filter flags
+-- set before this are stored (the menu shows them checked) but the list isn't rebuilt with them.
+local function IsProfessionDataReady()
+    if not C_TradeSkillUI then return false end
+    if C_TradeSkillUI.IsDataSourceChanging and C_TradeSkillUI.IsDataSourceChanging() then return false end
+    if C_TradeSkillUI.IsTradeSkillReady and not C_TradeSkillUI.IsTradeSkillReady() then return false end
+    return true
+end
+
+-- Linked / guild / NPC profession views aren't yours: don't restore or save filters there
+local function IsOwnProfessionView()
+    if not C_TradeSkillUI then return false end
+    return not ((C_TradeSkillUI.IsTradeSkillLinked and C_TradeSkillUI.IsTradeSkillLinked())
         or (C_TradeSkillUI.IsTradeSkillGuild and C_TradeSkillUI.IsTradeSkillGuild())
-        or (C_TradeSkillUI.IsNPCCrafting and C_TradeSkillUI.IsNPCCrafting()) then
+        or (C_TradeSkillUI.IsNPCCrafting and C_TradeSkillUI.IsNPCCrafting()))
+end
+
+-- Sets every filter from a saved set (missing values fall back to ReciPeek's defaults)
+local function ApplyFilterSet(set)
+    local function Want(key)
+        local v = set and set[key]
+        if v == nil then v = DEFAULT_FILTERS[key] end
+        return v and true or false
+    end
+    for _, f in ipairs(BLIZZARD_FILTERS) do
+        local setter = C_TradeSkillUI and C_TradeSkillUI[f.setter]
+        if setter then
+            local want = Want(f.key)
+            -- Flip first so the game always sees a change and re-filters, even if the flag
+            -- was already stored with this value but never applied to the list
+            setter(not want)
+            setter(want)
+        end
+    end
+    SetMaterialsFilterEnabled(Want("recipesHaveMats"))
+    SetOrdersFilterEnabled(Want("ordersHaveMats"))
+
+    -- Rebuild the Recipes list from the newly filtered recipes once the game has re-filtered
+    -- (our SetDataProvider hook re-applies the Have Materials filter on top)
+    local function Rebuild(triesLeft)
+        if not IsProfessionDataReady() then
+            if triesLeft > 0 then C_Timer.After(0.2, function() Rebuild(triesLeft - 1) end) end
+            return
+        end
+        RefreshNativeRecipeList()
+        UpdateFilterDropdownResetState()
+        UpdateOrdersFilterDropdownResetState()
+    end
+    C_Timer.After(0.3, function() Rebuild(10) end)
+end
+
+local sessionFiltersRestored = false
+local ownViewOpen = false      -- the open (or last open) profession window is your own
+local filtersWaiting = false
+
+-- Saves the current filters (called when the window closes and on logout / reload)
+local function SaveCurrentFilters()
+    if not IsRememberFiltersOn() or not sessionFiltersRestored or not ownViewOpen or not C_TradeSkillUI then return end
+    -- On the Crafting Orders tab the game is showing that tab's own filters and keeps the
+    -- Recipes tab's filters in a snapshot, so read those from the snapshot
+    local snapshot
+    local ordersPage = GetOrdersPage()
+    if ordersPage and ordersPage:IsShown() and ProfessionsFrame and type(ProfessionsFrame.recipesFilters) == "table" then
+        snapshot = ProfessionsFrame.recipesFilters
+    end
+    local saved = {
+        recipesHaveMats = materialsFilterEnabled,
+        ordersHaveMats = ordersFilterEnabled,
+    }
+    for _, f in ipairs(BLIZZARD_FILTERS) do
+        local getter = C_TradeSkillUI[f.getter]
+        local value
+        if snapshot then
+            value = snapshot[f.field]
+        elseif getter then
+            value = getter()
+        end
+        if value ~= nil then saved[f.key] = value and true or false end
+    end
+    ReciPeekDB = ReciPeekDB or {}
+    ReciPeekDB.savedFilters = saved
+end
+
+-- Runs each time the profession window opens; restores filters on the first open of the session
+local function OnProfessionWindowOpened(triesLeft)
+    if filtersWaiting or not C_TradeSkillUI then return end
+    if not ProfessionsFrame or not ProfessionsFrame:IsShown() then return end
+
+    -- Wait (up to ~6s) for the profession's recipes to finish loading, or the flags won't take
+    if not IsProfessionDataReady() then
+        triesLeft = triesLeft or 30
+        if triesLeft > 0 then
+            filtersWaiting = true
+            C_Timer.After(0.2, function()
+                filtersWaiting = false
+                OnProfessionWindowOpened(triesLeft - 1)
+            end)
+        end
         return
     end
-    sessionDefaultFiltersApplied = true
 
-    if C_TradeSkillUI.SetShowLearned then C_TradeSkillUI.SetShowLearned(true) end
-    if C_TradeSkillUI.SetShowUnlearned then C_TradeSkillUI.SetShowUnlearned(false) end
-    SetMaterialsFilterEnabled(true)
-    SetOrdersFilterEnabled(true)
+    ownViewOpen = IsOwnProfessionView()
+    if not ownViewOpen or sessionFiltersRestored then return end
+    sessionFiltersRestored = true
+
+    local saved = IsRememberFiltersOn() and ReciPeekDB and ReciPeekDB.savedFilters
+    ApplyFilterSet(type(saved) == "table" and saved or nil)
 end
 
 local function TryHookProfessionsFrame()
@@ -2620,11 +2742,12 @@ local function TryHookProfessionsFrame()
                 if #openTabs > 0 then RefreshPeekWindow() end
             end)
             -- After Blizzard has finished setting up its own filters for the window
-            C_Timer.After(0.2, ApplySessionDefaultFilters)
+            C_Timer.After(0.2, function() OnProfessionWindowOpened() end)
         end)
 
         ProfessionsFrame:HookScript("OnHide", function()
             if peekFrame then peekFrame:Hide() end
+            SaveCurrentFilters()
         end)
     end
 
@@ -2750,6 +2873,7 @@ end
 -- Main Event Dispatcher
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
+eventFrame:RegisterEvent("PLAYER_LOGOUT")
 eventFrame:RegisterEvent("TRADE_SKILL_LIST_UPDATE")
 eventFrame:RegisterEvent("TRADE_SKILL_DATA_SOURCE_CHANGED")
 eventFrame:RegisterEvent("BAG_UPDATE_DELAYED")
@@ -2764,11 +2888,15 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
         if arg1 == ADDON_NAME then
             ReciPeekDB = ReciPeekDB or {}
             ReciPeekDB.filterIncludeBank = nil  -- old "Include Bank" setting (removed); drop the stale saved value
+            ReciPeekDB.startFilters = nil       -- unreleased "Starting Filters" test build; replaced by Remember Filters
             local version = C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(ADDON_NAME, "Version")
             print("|cFF00CCFFReci|r|cFFFFD100Peek|r " .. (version and ("v" .. version .. " ") or "") .. "loaded! Craftable reagents and Crafting Orders with combined materials on hand are highlighted in green.")
         elseif arg1 == "Blizzard_Professions" then
             TryHookProfessionsFrame()
         end
+    elseif event == "PLAYER_LOGOUT" then
+        -- Logging out or /reload with the window still open: save before SavedVariables are written
+        if ProfessionsFrame and ProfessionsFrame:IsShown() then SaveCurrentFilters() end
     elseif event == "TRADE_SKILL_LIST_UPDATE" or event == "TRADE_SKILL_DATA_SOURCE_CHANGED" then
         TryHookProfessionsFrame()
         RebuildProfessionItemMap()
@@ -2888,27 +3016,40 @@ if Menu and Menu.ModifyMenu then
             return
         end
 
-        local checkbox
+        local rememberLabel = "Remember Filters"
+        local function IsRememberChecked() return IsRememberFiltersOn() end
+        local function ToggleRemember() SetRememberFilters(not IsRememberFiltersOn()) end
+
+        local checkbox, rememberBox
         if MenuUtil and MenuUtil.CreateTitle and MenuUtil.CreateCheckbox and MenuUtil.CreateDivider and rootDescription.Insert then
-            -- Pin to the top of the menu: [ReciPeek] [filter] [divider] then Blizzard's filters
+            -- Pin to the top of the menu: [ReciPeek] [filter] [Remember Filters] [divider] then Blizzard's filters
             rootDescription:Insert(MenuUtil.CreateTitle("ReciPeek"), 1)
             checkbox = rootDescription:Insert(MenuUtil.CreateCheckbox(label, isChecked, onToggle), 2)
-            rootDescription:Insert(MenuUtil.CreateDivider(), 3)
+            rememberBox = rootDescription:Insert(MenuUtil.CreateCheckbox(rememberLabel, IsRememberChecked, ToggleRemember), 3)
+            rootDescription:Insert(MenuUtil.CreateDivider(), 4)
         else
             -- Fallback: append to the bottom
             rootDescription:CreateDivider()
             rootDescription:CreateTitle("ReciPeek")
             checkbox = rootDescription:CreateCheckbox(label, isChecked, onToggle)
+            rememberBox = rootDescription:CreateCheckbox(rememberLabel, IsRememberChecked, ToggleRemember)
         end
 
-        if checkbox and checkbox.SetTooltip then
-            checkbox:SetTooltip(function(tooltip)
-                GameTooltip_SetTitle(tooltip, label)
-                for _, line in ipairs(tooltipLines) do
+        local function AddTooltip(desc, title, lines)
+            if not desc or not desc.SetTooltip then return end
+            desc:SetTooltip(function(tooltip)
+                GameTooltip_SetTitle(tooltip, title)
+                for _, line in ipairs(lines) do
                     GameTooltip_AddNormalLine(tooltip, line)
                 end
             end)
         end
+        AddTooltip(checkbox, label, tooltipLines)
+        AddTooltip(rememberBox, rememberLabel, {
+            "Open your professions with the filters you had when you last closed the window: ReciPeek's, plus Blizzard's Learned, Unlearned, Have Materials, Has Skill Up and First Craft.",
+            "Turn off to start each session with ReciPeek's defaults: Have Materials on, Learned on, Unlearned off.",
+            "|cFF888888Saved for your account.|r",
+        })
     end)
 end
 
