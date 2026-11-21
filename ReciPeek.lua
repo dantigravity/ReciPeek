@@ -1,11 +1,17 @@
 -- ============================================================================
--- ReciPeek (v1.6.0)
+-- ReciPeek (v1.7.0)
 -- Author: Dantigravity
 -- Description: Tabbed reagent recipe inspector, custom quantity crafter, and
 --              availability highlighter for Recipes and Crafting Orders.
 -- ============================================================================
 
 local ADDON_NAME = "ReciPeek"
+
+-- WoW: Forever (interface 16xxx) runs the Retail professions window, but without the
+-- Crafting Orders tab or the Learned / Unlearned recipe filters
+local INTERFACE_VERSION = select(4, GetBuildInfo()) or 0
+local IS_FOREVER = INTERFACE_VERSION >= 16000 and INTERFACE_VERSION < 17000
+local HAS_CRAFTING_ORDERS = not IS_FOREVER
 
 SLASH_RECIPEEK1 = "/rp"
 SLASH_RECIPEEK2 = "/recipeek"
@@ -1006,7 +1012,7 @@ local function UpdateOrdersFilterDropdownResetState()
 end
 
 local function SetOrdersFilterEnabled(enabled)
-    enabled = enabled and true or false
+    enabled = (enabled and HAS_CRAFTING_ORDERS) and true or false
     if ordersFilterEnabled == enabled then return end
     ordersFilterEnabled = enabled
     -- Defer so the rebuild does not run inside the open filter menu's click handler
@@ -2883,9 +2889,22 @@ local function EnsureQuickviewWatcher(scrollBox)
     quickviewWatcher:SetScript("OnHide", ClearRecipeQuickview)
 end
 
+-- ScrollUtil's initialized-frame callback passes the row first on Retail, but Forever puts a
+-- numeric callback handle in front of it: take the first argument that is actually a frame
+local function GetFrameFromCallbackArgs(...)
+    for i = 1, select("#", ...) do
+        local v = select(i, ...)
+        if type(v) == "table" and v.GetObjectType then return v end
+    end
+    return nil
+end
+
 -- Called for each Recipes list row as it's set up (also when scrolled into view or reused)
-local function OnRecipeRowInitialized(row)
-    UpdateRecipeRowHighlight(row)  -- keep tints on the right rows while the list scrolls
+local function OnRecipeRowInitialized(...)
+    local row = GetFrameFromCallbackArgs(...)
+    if row then
+        UpdateRecipeRowHighlight(row)  -- keep tints on the right rows while the list scrolls
+    end
 end
 
 -- /rp hover: explains what the quickview sees under the mouse (hover a recipe row, then type it)
@@ -3036,12 +3055,19 @@ local DEFAULT_FILTERS = {
 
 -- Blizzard's Recipes tab filters that get remembered. field = key in Blizzard's own filter snapshot.
 local BLIZZARD_FILTERS = {
-    { key = "learned",    getter = "GetShowLearned",               setter = "SetShowLearned",               field = "showLearned" },
-    { key = "unlearned",  getter = "GetShowUnlearned",             setter = "SetShowUnlearned",             field = "showUnlearned" },
+    { key = "learned",    getter = "GetShowLearned",               setter = "SetShowLearned",               field = "showLearned",   retailOnly = true },
+    { key = "unlearned",  getter = "GetShowUnlearned",             setter = "SetShowUnlearned",             field = "showUnlearned", retailOnly = true },
     { key = "makeable",   getter = "GetOnlyShowMakeableRecipes",   setter = "SetOnlyShowMakeableRecipes",   field = "showOnlyMakeable" },
     { key = "skillUp",    getter = "GetOnlyShowSkillUpRecipes",    setter = "SetOnlyShowSkillUpRecipes",    field = "showOnlySkillUps" },
     { key = "firstCraft", getter = "GetOnlyShowFirstCraftRecipes", setter = "SetOnlyShowFirstCraftRecipes", field = "showOnlyFirstCraft" },
 }
+
+-- Forever's Filter menu has no Learned / Unlearned options, so leave those flags alone there
+if IS_FOREVER then
+    for i = #BLIZZARD_FILTERS, 1, -1 do
+        if BLIZZARD_FILTERS[i].retailOnly then table.remove(BLIZZARD_FILTERS, i) end
+    end
+end
 
 local function IsRememberFiltersOn()
     return not (ReciPeekDB and ReciPeekDB.rememberFilters == false)
@@ -3172,7 +3198,7 @@ end
 
 local function OpenSettingsMenu(anchor)
     if not MenuUtil or not MenuUtil.CreateContextMenu then
-        print("|cFF00CCFFReciPeek:|r The settings menu isn't available. Use /rp tips, /rp filter or /rp orders.")
+        print("|cFF00CCFFReciPeek:|r The settings menu isn't available. Use /rp tips, /rp filter" .. (HAS_CRAFTING_ORDERS and " or /rp orders." or "."))
         return
     end
     MenuUtil.CreateContextMenu(anchor or UIParent, function(_, root)
@@ -3199,8 +3225,10 @@ local function OpenSettingsMenu(anchor)
         root:CreateTitle("Filters")
         Check("Have Materials: Recipes", function() return materialsFilterEnabled end, SetMaterialsFilterEnabled,
             { "Only show recipes you can craft now, counting reagents you could craft first. Also /rp filter." })
-        Check("Have Materials: Crafting Orders", function() return ordersFilterEnabled end, SetOrdersFilterEnabled,
-            { "Only show orders you can fill with the customer's reagents plus yours. Also /rp orders." })
+        if HAS_CRAFTING_ORDERS then
+            Check("Have Materials: Crafting Orders", function() return ordersFilterEnabled end, SetOrdersFilterEnabled,
+                { "Only show orders you can fill with the customer's reagents plus yours. Also /rp orders." })
+        end
         Check("Remember Filters", IsRememberFiltersOn, SetRememberFilters,
             { "Open your professions with the filters you had when you last closed the window." })
     end)
@@ -3383,8 +3411,9 @@ local function TryHookProfessionsFrame()
         end
 
         if ScrollUtil and ScrollUtil.AddInitializedFrameCallback then
-            ScrollUtil.AddInitializedFrameCallback(scrollBox, function(row)
-                UpdateSingleOrderRowHighlight(row)
+            ScrollUtil.AddInitializedFrameCallback(scrollBox, function(...)
+                local row = GetFrameFromCallbackArgs(...)
+                if row then UpdateSingleOrderRowHighlight(row) end
             end, nil, true)
         end
 
@@ -3416,7 +3445,8 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1, arg2, arg3)
             ReciPeekDB.filterIncludeBank = nil  -- old "Include Bank" setting (removed); drop the stale saved value
             ReciPeekDB.startFilters = nil       -- unreleased "Starting Filters" test build; replaced by Remember Filters
             local version = C_AddOns and C_AddOns.GetAddOnMetadata and C_AddOns.GetAddOnMetadata(ADDON_NAME, "Version")
-            print("|cFF00CCFFReci|r|cFFFFD100Peek|r " .. (version and ("v" .. version .. " ") or "") .. "loaded! Craftable reagents and Crafting Orders with combined materials on hand are highlighted in green.")
+            local highlighted = HAS_CRAFTING_ORDERS and "Craftable reagents and Crafting Orders with combined materials on hand are" or "Craftable reagents with materials on hand are"
+            print("|cFF00CCFFReci|r|cFFFFD100Peek|r " .. (version and ("v" .. version .. " ") or "") .. "loaded! " .. highlighted .. " highlighted in green.")
         elseif arg1 == "Blizzard_Professions" then
             TryHookProfessionsFrame()
         end
@@ -3667,6 +3697,10 @@ SlashCmdList["RECIPEEK"] = function(msg)
         print("|cFF00CCFFReciPeek:|r Have Materials (incl. Sub-Crafts) filter " .. (materialsFilterEnabled and "|cFF00FF66enabled|r" or "|cFFFF6666disabled|r") .. ".")
         return
     elseif cmd == "orders" then
+        if not HAS_CRAFTING_ORDERS then
+            print("|cFF00CCFFReciPeek:|r Crafting Orders aren't available in this version of the game.")
+            return
+        end
         SetOrdersFilterEnabled(not ordersFilterEnabled)
         print("|cFF00CCFFReciPeek:|r Crafting Orders Have Materials filter " .. (ordersFilterEnabled and "|cFF00FF66enabled|r" or "|cFFFF6666disabled|r") .. ".")
         return
